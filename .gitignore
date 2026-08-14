@@ -1,0 +1,38 @@
+# Python build / packaging artifacts
+*.egg-info/
+build/
+dist/
+__pycache__/
+*.py[cod]
+.eggs/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Secrets — NEVER commit real values; use .env.example as the template
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials/
+secrets/
+
+# Generated bundles / archives (rebuildable; not source)
+*.tar.gz
+*.tar.gz.sha256
+*.bundle
+*.patch
+
+# OS / editor noise
+.DS_Store
+*.swp

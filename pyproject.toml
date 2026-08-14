@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openclaw-claude-loop"
+version = "0.1.0"
+description = "File-driven Claude Code worker loop scaffold — delegate tasks to per-project CTO agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "TODO — see LICENSE"}
+keywords = ["claude", "claude-code", "ai-agents", "llm", "orchestration"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+
+[project.scripts]
+openclaw-claude-loop = "openclaw_claude_loop.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["openclaw_claude_loop*"]
