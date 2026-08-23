@@ -1,4 +1,6 @@
-# openclaw-claude-loop
+# Talos
+
+*Python package & CLI: `openclaw-claude-loop`*
 
 A **file-driven task queue** that lets an orchestrator delegate work to
 per-project [Claude Code](https://claude.ai/code) sessions acting as autonomous
