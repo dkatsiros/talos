@@ -58,24 +58,27 @@ print(result["state"], result["summary"])
 
 ```bash
 # Bootstrap a project
-openclaw-claude-loop --project-root /path/to/project bootstrap
+talos --project-root /path/to/project bootstrap
 
 # Enqueue a task
-openclaw-claude-loop --project-root /path/to/project enqueue "Add /healthcheck" \
+talos --project-root /path/to/project enqueue "Add /healthcheck" \
     --role cto \
     --instruction "Add GET /healthcheck to app/main.py returning {build_sha, timestamp}" \
     --instruction "Write pytest in tests/test_healthcheck.py and run it"
 
 # Render the prompt (parks the task ready for hand-off)
-openclaw-claude-loop --project-root /path/to/project run-worker \
+talos --project-root /path/to/project run-worker \
     --backend subscription-interactive --once
 
 # Spawn the Claude session and wait for the result
-openclaw-claude-loop --project-root /path/to/project run-handoff <task_id>
+talos --project-root /path/to/project run-handoff <task_id>
 
 # Check queue status
-openclaw-claude-loop --project-root /path/to/project status --tasks
+talos --project-root /path/to/project status --tasks
 ```
+
+> **Note:** The underlying Python package is `openclaw-claude-loop` (pip install / `import openclaw_claude_loop`).
+> The `talos` command is a convenience alias — both names invoke the same engine.
 
 ---
 

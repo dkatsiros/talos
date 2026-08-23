@@ -22,6 +22,7 @@ classifiers = [
 
 [project.scripts]
 openclaw-claude-loop = "openclaw_claude_loop.cli:main"
+talos = "openclaw_claude_loop.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
