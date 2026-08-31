@@ -247,16 +247,20 @@ def spawn_remote(
     mirror_root: str,
     session_name: str,
     claude_cmd: str,
+    env: Mapping[str, str] | None = None,
 ) -> str:
     """Push the task mirror and spawn the remote screen. Returns the remote dir.
 
     Raises on rsync/ssh failure so the caller can decide (the caller only
     reaches here after a successful preflight; a failure here is a real error,
     not "remote host offline").
+
+    env: optional env dict forwarded to build_remote_inner for per-task model
+         selection (e.g. {"ANTHROPIC_MODEL": "claude-sonnet-4-6"}).
     """
     rsync_push(task_dir, ssh_target, mirror_root, task_id)
     remote_dir = remote_task_dir(mirror_root, task_id)
-    inner = build_remote_inner(remote_dir, claude_cmd)
+    inner = build_remote_inner(remote_dir, claude_cmd, env=env)
     argv = build_remote_screen_argv(ssh_target, session_name, inner)
     subprocess.run(argv, check=True)
     return remote_dir

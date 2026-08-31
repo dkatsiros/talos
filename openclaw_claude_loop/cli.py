@@ -1200,6 +1200,11 @@ def run_handoff(args: argparse.Namespace) -> int:
                 f"Screen session {session_name} already running. Attach with: screen -r {session_name}"
             )
 
+        # Per-task model override: task.json["model"] selects the Talos model.
+        # CTO convention: sonnet for easy/research/diagnose; opus (default) for hard builds.
+        # This is extracted early so both remote + local paths use the same value.
+        task_model = task.get("model", "").strip() if isinstance(task, dict) else ""
+
         # execution_host targeting (remote-offload, Path C). Default is local;
         # behaviour is byte-identical to the pre-existing path when unset.
         execution_host = task.get("execution_host", "local")
@@ -1245,6 +1250,12 @@ def run_handoff(args: argparse.Namespace) -> int:
             if not args.quiet:
                 remote_argv += ["--verbose", "--output-format", "stream-json"]
             remote_claude_cmd = " ".join(remote_argv)
+            _remote_env = dict(os.environ)
+            if task_model:
+                _remote_env["ANTHROPIC_MODEL"] = task_model
+                print(f"Per-task model override (remote): {task_model}")
+            else:
+                _remote_env.setdefault("ANTHROPIC_MODEL", remote_exec.DEFAULT_ANTHROPIC_MODEL)
             remote_exec.spawn_remote(
                 task_dir=task_dir,
                 task_id=task_id,
@@ -1252,6 +1263,7 @@ def run_handoff(args: argparse.Namespace) -> int:
                 mirror_root=mirror_root,
                 session_name=session_name,
                 claude_cmd=remote_claude_cmd,
+                env=_remote_env,
             )
             update_status(
                 task_dir,
@@ -1329,13 +1341,26 @@ def run_handoff(args: argparse.Namespace) -> int:
                 + f" 2>&1 | tee {shlex.quote(str(session_log))}"
                 + worktree_cleanup
             )
-            # Default model = claude-opus-4-8 (override via ANTHROPIC_MODEL).
-            # Matches the gateway default set by the 2026-08-27 Opus-5→4-8 rollback;
-            # the env var was missed then, keeping Talos on Opus 5 until 2026-08-31.
-            # setdefault preserves explicit overrides — e.g. ANTHROPIC_MODEL=claude-fable-5
-            # still wins for hard builds.
+            # Model selection (priority order):
+            #   1. task.json["model"] — per-task CTO choice (highest priority)
+            #   2. ANTHROPIC_MODEL env var — caller/shell override
+            #   3. Default: claude-opus-4-8 (hard builds, architecture)
+            #
+            # CTO model convention:
+            #   claude-sonnet-4-6  → easy/read-only/research/diagnose tasks
+            #   claude-opus-4-8    → hard build/architecture/multi-file refactor (default)
+            #   claude-fable-5     → deep reasoning/planning tasks
+            #
+            # To select model in task.json:
+            #   {"model": "claude-sonnet-4-6", ...}
+            # To select via max-dispatch.py:
+            #   python3 scripts/max-dispatch.py --project foo --model claude-sonnet-4-6 ...
             spawn_env = os.environ.copy()
-            spawn_env.setdefault("ANTHROPIC_MODEL", "claude-opus-4-8")
+            if task_model:
+                spawn_env["ANTHROPIC_MODEL"] = task_model
+                print(f"Per-task model override (local): {task_model}")
+            else:
+                spawn_env.setdefault("ANTHROPIC_MODEL", "claude-opus-4-8")
             subprocess.run(
                 [screen_bin, "-dmS", session_name, "bash", "-c", inner],
                 check=True,
