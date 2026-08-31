@@ -42,7 +42,7 @@ DEFAULT_PREFLIGHT_TIMEOUT_S = 3
 # (spawn_env.setdefault). SSH does not forward arbitrary env vars, so the remote
 # command must carry the model explicitly or the remote host falls back to whatever
 # its own shell profile sets.
-DEFAULT_ANTHROPIC_MODEL = "claude-opus-5"
+DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-8"
 
 # Files that make up the task mirror. Everything else in the task dir is either
 # regenerable or a result we pull back, so we keep the push minimal.

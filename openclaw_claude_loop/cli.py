@@ -1329,11 +1329,13 @@ def run_handoff(args: argparse.Namespace) -> int:
                 + f" 2>&1 | tee {shlex.quote(str(session_log))}"
                 + worktree_cleanup
             )
-            # Default model = claude-opus-5 (override via ANTHROPIC_MODEL).
+            # Default model = claude-opus-4-8 (override via ANTHROPIC_MODEL).
+            # Matches the gateway default set by the 2026-08-27 Opus-5→4-8 rollback;
+            # the env var was missed then, keeping Talos on Opus 5 until 2026-08-31.
             # setdefault preserves explicit overrides — e.g. ANTHROPIC_MODEL=claude-fable-5
             # still wins for hard builds.
             spawn_env = os.environ.copy()
-            spawn_env.setdefault("ANTHROPIC_MODEL", "claude-opus-5")
+            spawn_env.setdefault("ANTHROPIC_MODEL", "claude-opus-4-8")
             subprocess.run(
                 [screen_bin, "-dmS", session_name, "bash", "-c", inner],
                 check=True,
