@@ -1146,6 +1146,68 @@ def as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+RESULT_SUCCESS_STATES = {"completed", "verified", "done", "success", "succeeded",
+                         "ok", "passed", "staged_pending_rollout",
+                         "completed_with_caveat", "completed_with_caveats"}
+RESULT_FAIL_STATES = {"failed", "error", "errored", "rejected"}
+RESULT_BLOCK_STATES = {"blocked", "needs_clarification", "needs_approval"}
+
+
+def normalize_result_state(raw_state: Any) -> str | None:
+    """Map a builder-written result.state to completed | failed | blocked.
+
+    Builders improvise compound states ("completed_pending_deploy",
+    "completed_with_blocker", "completed_planning", "partial"). The 2026-09-06
+    audit found 4 tasks stuck in "running" for days because finalize rejected
+    such a state outright. Map by intent instead: anything blocker/partial/
+    needs_-shaped is a human decision (blocked); any other completed_* / done_*
+    is completed; fail*/error* is failed. Returns None only for states with no
+    recognisable intent — the caller must still refuse those.
+    """
+    s = str(raw_state if raw_state is not None else "completed").strip().lower()
+    if not s:
+        s = "completed"
+    if s in RESULT_SUCCESS_STATES:
+        return "completed"
+    if s in RESULT_FAIL_STATES:
+        return "failed"
+    if s in RESULT_BLOCK_STATES:
+        return "blocked"
+    if any(k in s for k in ("blocker", "blocked", "partial", "needs_", "clarif")):
+        return "blocked"
+    if s.startswith(("completed", "complete_", "done", "success", "verified", "ok_")):
+        return "completed"
+    if s.startswith(("fail", "error", "reject", "abort")):
+        return "failed"
+    return None
+
+
+def flatten_artifacts(value: Any) -> list[str]:
+    """Flatten a dict/nested artifacts value into the list-of-strings contract.
+
+    Builders often write {"label": "path", "group": ["a", "b"]}; that used to
+    fail `artifacts must be a list` forever (autorunner retried every 10 min
+    for 10 h on 2026-09-05 without ever surfacing why). Keep the information,
+    drop the shape mismatch.
+    """
+    out: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, (list, tuple, dict)):
+                out.extend(f"{key}: {x}" for x in flatten_artifacts(item))
+            elif item is not None:
+                out.append(f"{key}: {item}")
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, (list, tuple, dict)):
+                out.extend(flatten_artifacts(item))
+            elif item is not None:
+                out.append(str(item))
+    elif value is not None:
+        out.append(str(value))
+    return out
+
+
 def validate_completed_result_contract(result: dict[str, Any], task: dict[str, Any]) -> list[str]:
     """Return human-readable contract errors for completed handoffs.
 
@@ -1175,6 +1237,8 @@ def validate_completed_result_contract(result: dict[str, Any], task: dict[str, A
             errors.append(f"verification.{key} must be a list")
 
     artifacts = result.get("artifacts")
+    if isinstance(artifacts, dict):
+        artifacts = flatten_artifacts(artifacts)
     if not isinstance(artifacts, list):
         errors.append("artifacts must be a list of durable output paths")
         artifacts = []
@@ -2237,6 +2301,30 @@ def run_handoff(args: argparse.Namespace) -> int:
         return complete_handoff(args)
 
 
+TERMINAL_STATUS_STATES = ("completed", "done", "failed", "blocked", "cancelled")
+
+
+def _repair_status_from_terminal_token(task_dir: Path, terminal: str,
+                                       result_state: str) -> str | None:
+    """If status.json is non-terminal while the queue token is, align it.
+
+    Returns the new status state when a repair was written, else None.
+    """
+    st = read_json(task_dir / "status.json", {})
+    if not isinstance(st, dict) or st.get("state") in TERMINAL_STATUS_STATES:
+        return None
+    if terminal == "done":
+        new_state = "completed"
+    else:
+        new_state = "blocked" if result_state == "blocked" else "failed"
+    st.update({"state": new_state, "phase": "reconciled_from_queue",
+               "updated_at": utc_now(),
+               "finalize_note": f"status was {st.get('state')!r} while queue/{terminal} "
+                                f"held the token; aligned to the token"})
+    write_json(task_dir / "status.json", st)
+    return new_state
+
+
 def complete_handoff(args: argparse.Namespace) -> int:
     project_root = project_root_from(args)
     root = require_bootstrap(project_root)
@@ -2267,22 +2355,14 @@ def complete_handoff(args: argparse.Namespace) -> int:
     # CTOs sometimes write "verified", "done", "success", "ok", etc. — treat
     # those as completed. staged_pending_rollout is a dep-success state
     # (autorunner DEP_SUCCESS_RESULT_STATES) and MUST be finalizable, or chains
-    # behind it deadlock forever. Only explicit fail/block states route to failed.
-    SUCCESS_STATES = {"completed", "verified", "done", "success", "succeeded",
-                      "ok", "passed", "staged_pending_rollout",
-                      "completed_with_caveat", "completed_with_caveats"}
-    FAIL_STATES = {"failed", "error", "errored", "rejected"}
-    BLOCK_STATES = {"blocked", "needs_clarification", "needs_approval"}
-    if raw_state in SUCCESS_STATES:
-        result_state = "completed"
-    elif raw_state in FAIL_STATES:
-        result_state = "failed"
-    elif raw_state in BLOCK_STATES:
-        result_state = "blocked"
-    else:
+    # behind it deadlock forever. Compound states are mapped by intent
+    # (see normalize_result_state); only intent-less states are refused.
+    result_state = normalize_result_state(raw_state)
+    if result_state is None:
         raise SystemExit(
             f"result.json has unrecognized state: {raw_state!r}. "
-            f"Expected one of: {sorted(SUCCESS_STATES | FAIL_STATES | BLOCK_STATES)}"
+            f"Expected one of: "
+            f"{sorted(RESULT_SUCCESS_STATES | RESULT_FAIL_STATES | RESULT_BLOCK_STATES)}"
         )
 
     if result_state == "completed":
@@ -2338,12 +2418,41 @@ def complete_handoff(args: argparse.Namespace) -> int:
                              "warning": "sandbox merge not verified — see handoff alert"},
                             indent=2, sort_keys=True))
                         return 0
+                    # Status desync: the token is terminal but status.json still
+                    # says running/needs_approval (2026-09-06 audit: 5 tasks, one
+                    # 98 days old). Repair it so watchers stop counting a finished
+                    # task as live; the token is the source of truth here.
+                    _repaired = _repair_status_from_terminal_token(
+                        task_dir, terminal, result_state)
                     print(json.dumps({"task_id": task_id, "state": "already_finalized",
-                                      "queue": terminal}, indent=2, sort_keys=True))
+                                      "queue": terminal,
+                                      **({"status_repaired": _repaired} if _repaired else {})},
+                                     indent=2, sort_keys=True))
                     return 0
-            raise SystemExit(
-                f"No queue entry for {task_id} in any queue state. Cancelled?"
-            )
+            # Orphan: result.json exists but the queue token is gone (cancelled by
+            # hand, lost in a project copy/rename, or an old engine that never
+            # wrote one). Refusing forever leaves the task "running" for weeks
+            # (2026-09-06 audit: 12 such tasks, oldest 45 days). Record the honest
+            # terminal state from result.json and say so loudly. No merge-back is
+            # attempted: without a token there is no worktree lifecycle to close.
+            _ost = read_json(task_dir / "status.json", {})
+            if not isinstance(_ost, dict):
+                _ost = {}
+            _orphan_state = result_state  # engine vocabulary: completed | failed | blocked
+            _ost.update({
+                "state": _orphan_state,
+                "phase": "finalized_orphan",
+                "updated_at": utc_now(),
+                "finalize_note": ("no queue token in any state; status set from "
+                                  f"result.json state={raw_state!r}"),
+            })
+            write_json(task_dir / "status.json", _ost)
+            print(json.dumps({"task_id": task_id, "state": "finalized_orphan",
+                              "status": _orphan_state, "result_state": raw_state,
+                              "warning": ("no queue entry in any state — status set "
+                                          "from result.json; nothing merged")},
+                             indent=2, sort_keys=True))
+            return 0
 
         _cst = read_json(task_dir / "status.json", {})
         # Sandbox tasks (Milestone 2): the talos/<task_id> branch lives on the
