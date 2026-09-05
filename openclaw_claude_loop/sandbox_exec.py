@@ -453,6 +453,9 @@ def build_agent_container_cmd(
         "claude", "-p", shlex.quote(handoff_prompt + sandbox_directive),
         "--add-dir", "/work",
         "--permission-mode", shlex.quote(permission_mode),
+        # Load the TARGET repo's own .claude context (skills + CLAUDE.md) mounted
+        # at /work in addition to user settings. Default "user" turns it OFF.
+        "--setting-sources", "user,project",
     ]
     if role_prompt:
         argv += ["--append-system-prompt", shlex.quote(role_prompt)]

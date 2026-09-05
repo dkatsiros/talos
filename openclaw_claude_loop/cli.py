@@ -1650,6 +1650,11 @@ def run_handoff(args: argparse.Namespace) -> int:
                 shlex.quote(remote_dir),
                 "--permission-mode",
                 shlex.quote(permission_mode),
+                # Load the TARGET repo's own .claude context (skills + CLAUDE.md)
+                # in addition to user settings. Default is effectively "user",
+                # which switches the project's own agent context OFF.
+                "--setting-sources",
+                "user,project",
             ]
             if role_prompt:
                 remote_argv += ["--append-system-prompt", shlex.quote(role_prompt)]
@@ -1868,6 +1873,11 @@ def run_handoff(args: argparse.Namespace) -> int:
                 shlex.quote(str(execution_root)),
                 "--permission-mode",
                 shlex.quote(permission_mode),
+                # Load the TARGET repo's own .claude context (skills + CLAUDE.md)
+                # in addition to user settings. Default is effectively "user",
+                # which switches the project's own agent context OFF.
+                "--setting-sources",
+                "user,project",
             ]
             if role_prompt:
                 local_argv += ["--append-system-prompt", shlex.quote(role_prompt)]
