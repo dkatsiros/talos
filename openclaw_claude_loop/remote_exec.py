@@ -5,11 +5,19 @@ claude-loop file queue on AWS, but run the `screen -dmS ... claude -p ...`
 execution step on the Shuttle home node via SSH, with rsync mirroring the task
 folder before the run and pulling results back while polling.
 
-Design invariants (see DECISIONS.md):
-- Default execution host is local; nothing here runs unless the task envelope
-  carries execution_host == "shuttle".
-- Any preflight failure falls back to the local screen path. We never raise on
-  Shuttle being offline; we log one JSON line and let the caller run locally.
+Design invariants (see DECISIONS.md; updated 2026-09-05, fleet plan step 1.2):
+- Default execution host is the SHUTTLE (resolve_execution_host). Precedence:
+  task.execution_host > project config.json "default_execution_host" >
+  DEFAULT_EXECUTION_HOST ("shuttle", env TALOS_DEFAULT_EXECUTION_HOST).
+  AWS-local is an explicit opt-in — the 3.7GB AWS head must not build.
+- A Shuttle run needs a repo mapping (shuttle_project_root): task.shuttle.
+  project_root > config.json execution_hosts.shuttle.project_root. Without it the
+  caller FAILS LOUD (handoff alert + SystemExit); it never runs locally instead.
+- Preflight or dispatch failure also FAILS LOUD. There is no silent local
+  fallback any more; log_fallback() still records the event for the watchers.
+- The builder runs INSIDE the mirrored repo (cwd = project_root on the Shuttle,
+  so --setting-sources user,project loads the repo's own CLAUDE.md/.claude) and
+  writes task files into the rsynced task mirror dir.
 - Only Dimitris's user runs agents (ssh target dimitris@...), agents write under
   /home/dimitris/. No new inbound ports, no LAN probing (enforced in the role
   prompt, ADR-005).
@@ -43,6 +51,59 @@ DEFAULT_PREFLIGHT_TIMEOUT_S = 3
 # token burner; see the Aug-2026 rollback). An explicit ANTHROPIC_MODEL /
 # task.json["model"] override still wins.
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-8"
+
+# Where a task runs when nobody says otherwise. "shuttle" since 2026-09-05
+# (fleet plan 1.2): the AWS head is a 3.7GB VM that has OOM'd under builds.
+# Env-overridable so a public checkout / CI can pin "local".
+VALID_EXECUTION_HOSTS = ("local", "shuttle", "shuttle-sandbox")
+DEFAULT_EXECUTION_HOST = os.environ.get("TALOS_DEFAULT_EXECUTION_HOST", "shuttle").strip().lower() or "shuttle"
+
+
+def resolve_execution_host(task: Mapping[str, Any] | None, project_config: Mapping[str, Any] | None = None) -> str:
+    """Where this task's claude session runs.
+
+    Precedence: task["execution_host"] > project config.json["default_execution_host"]
+    > DEFAULT_EXECUTION_HOST. Unknown values raise so a typo cannot silently
+    become a local run on the AWS head.
+    """
+    candidates = (
+        (task or {}).get("execution_host"),
+        (project_config or {}).get("default_execution_host"),
+        DEFAULT_EXECUTION_HOST,
+    )
+    for value in candidates:
+        if value is None or str(value).strip() == "":
+            continue
+        host = str(value).strip().lower()
+        if host not in VALID_EXECUTION_HOSTS:
+            raise ValueError(
+                f"Invalid execution_host {value!r}: expected one of {VALID_EXECUTION_HOSTS}"
+            )
+        return host
+    return "shuttle"
+
+
+def shuttle_project_root(task: Mapping[str, Any] | None, project_config: Mapping[str, Any] | None = None) -> str | None:
+    """Absolute path of the project's repo mirror on the Shuttle, or None.
+
+    Precedence: task["shuttle"]["project_root"] > config.json
+    ["execution_hosts"]["shuttle"]["project_root"]. Validated as an absolute
+    path (same option-injection guard as mirror_root).
+    """
+    task_shuttle = (task or {}).get("shuttle")
+    cfg_hosts = (project_config or {}).get("execution_hosts")
+    cfg_shuttle = cfg_hosts.get("shuttle") if isinstance(cfg_hosts, Mapping) else None
+    for source in (task_shuttle, cfg_shuttle):
+        if isinstance(source, Mapping):
+            value = source.get("project_root")
+            if isinstance(value, str) and value.strip():
+                value = value.strip()
+                if not value.startswith("/"):
+                    raise ValueError(
+                        f"Invalid shuttle project_root {value!r}: must be an absolute path"
+                    )
+                return value.rstrip("/") or "/"
+    return None
 
 # Files that make up the task mirror. Everything else in the task dir is either
 # regenerable or a result we pull back, so we keep the push minimal.
@@ -206,6 +267,7 @@ def build_remote_inner(
     claude_cmd: str,
     session_log_name: str = "claude-session.log",
     env: Mapping[str, str] | None = None,
+    cwd: str | None = None,
 ) -> str:
     """The command that runs inside the remote screen session.
 
@@ -213,12 +275,18 @@ def build_remote_inner(
     for a non-interactive ssh shell, so we prepend it explicitly. ANTHROPIC_MODEL
     is exported for the same reason: ssh does not carry the caller's env, so the
     Talos model default has to travel inside the remote command itself.
+
+    cwd: directory claude runs in — the mirrored repo (so the repo's own
+    CLAUDE.md/.claude load). Defaults to remote_dir. The session log always
+    lands in remote_dir (absolute path) so rsync_pull finds it either way.
     """
+    workdir = cwd or remote_dir
+    session_log = f"{remote_dir.rstrip('/')}/{session_log_name}"
     return (
         'export PATH="$HOME/.local/bin:$PATH" && '
         f"export ANTHROPIC_MODEL={shlex.quote(resolve_anthropic_model(env))} && "
-        f"cd {shlex.quote(remote_dir)} && "
-        f"{claude_cmd} 2>&1 | tee {shlex.quote(session_log_name)}"
+        f"cd {shlex.quote(workdir)} && "
+        f"{claude_cmd} 2>&1 | tee {shlex.quote(session_log)}"
     )
 
 
@@ -320,6 +388,7 @@ def spawn_remote(
     session_name: str,
     claude_cmd: str,
     env: Mapping[str, str] | None = None,
+    cwd: str | None = None,
 ) -> str:
     """Push the task mirror and spawn the remote screen. Returns the remote dir.
 
@@ -334,7 +403,7 @@ def spawn_remote(
     """
     rsync_push(task_dir, ssh_target, mirror_root, task_id)
     remote_dir = remote_task_dir(mirror_root, task_id)
-    inner = build_remote_inner(remote_dir, claude_cmd, env=env)
+    inner = build_remote_inner(remote_dir, claude_cmd, env=env, cwd=cwd)
     argv = build_remote_screen_argv(ssh_target, session_name, inner)
     subprocess.run(argv, check=True)
     return remote_dir

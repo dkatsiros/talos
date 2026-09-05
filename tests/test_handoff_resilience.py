@@ -43,11 +43,14 @@ def _prepare_task(tmp_path: Path, *, execution_host: str | None = None) -> tuple
     task = _cli(project, "enqueue", "Do a thing", "--role", "builder",
                 "--instruction", "echo hi")
     _cli(project, "run-worker", "--backend", "subscription-interactive", "--once")
-    if execution_host:
-        task_json = project / ".openclaw" / "claude-loop" / "tasks" / task / "task.json"
-        envelope = json.loads(task_json.read_text(encoding="utf-8"))
-        envelope["execution_host"] = execution_host
-        task_json.write_text(json.dumps(envelope), encoding="utf-8")
+    # Default execution host is the Shuttle since 2026-09-05; these tests
+    # exercise the LOCAL screen path unless a host is given, so pin local.
+    task_json = project / ".openclaw" / "claude-loop" / "tasks" / task / "task.json"
+    envelope = json.loads(task_json.read_text(encoding="utf-8"))
+    envelope["execution_host"] = execution_host or "local"
+    if execution_host == "shuttle":
+        envelope["shuttle"] = {"project_root": "/home/dimitris/toy"}
+    task_json.write_text(json.dumps(envelope), encoding="utf-8")
     return project, task
 
 
@@ -338,28 +341,34 @@ def test_permanent_spawn_failure_alerts_and_leaves_task_recoverable(tmp_path, mo
 
 
 # --------------------------------------------------------------------------- #
-# Remote path: dispatch failure now falls back instead of exploding            #
+# Remote path: dispatch failure FAILS LOUD (no local fallback — fleet plan 1.2) #
 # --------------------------------------------------------------------------- #
 
-def test_remote_dispatch_failure_falls_back_to_local(tmp_path, monkeypatch):
+def test_remote_dispatch_failure_fails_loud_no_local_fallback(tmp_path, monkeypatch):
     project, task = _prepare_task(tmp_path, execution_host="shuttle")
     fake = FakeHost(cli.screen_session_name(task), remote_spawn_failures=99)
     _install(monkeypatch, fake)
 
-    assert cli.run_handoff(_args(project, task, detach=True)) == 0
+    with pytest.raises(SystemExit) as excinfo:
+        cli.run_handoff(_args(project, task, detach=True))
+    assert "local fallback is disabled" in str(excinfo.value)
 
-    # Retried the shuttle, then ran locally rather than raising.
+    # Retried the shuttle; NEVER ran on the AWS head.
     assert len(fake.remote_spawns()) == cli.SPAWN_ATTEMPTS
-    assert len(fake.local_spawns()) == 1
+    assert fake.local_spawns() == []
 
     fallback_log = _loop(project) / "logs" / "shuttle-offload-fallback.jsonl"
     entries = resilience.tail_jsonl(fallback_log)
-    assert any("dispatch failed" in e["reason"] for e in entries)
+    assert any("dispatch failed" in e["reason"] and "NO local fallback" in e["reason"] for e in entries)
     assert any(e["event"] == "remote_dispatch_failed" for e in _events(project))
 
-    # The run RECOVERED, so no outstanding alert — that channel means
-    # "a human must look at this task".
-    assert not (_loop(project) / "tasks" / task / cli.HANDOFF_ALERT_FILE).exists()
+    # A human must look at this task: dead-man alert + re-runnable state.
+    task_dir = _loop(project) / "tasks" / task
+    alert = json.loads((task_dir / cli.HANDOFF_ALERT_FILE).read_text(encoding="utf-8"))
+    assert alert["outcome"] == "shuttle_dispatch_failed"
+    status = json.loads((task_dir / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "needs_approval"
+    assert (_loop(project) / "queue" / "blocked" / f"{task}.json").exists()
 
 
 def test_broken_result_sync_is_alerted_while_polling_continues(tmp_path, monkeypatch):

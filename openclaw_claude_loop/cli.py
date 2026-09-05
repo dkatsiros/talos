@@ -1546,10 +1546,19 @@ def run_handoff(args: argparse.Namespace) -> int:
         # A fresh attempt supersedes whatever the previous one alerted about.
         clear_handoff_alert(root, task_dir, task_id)
 
-        # execution_host targeting (shuttle-offload, Path C). Default is local;
-        # behaviour is byte-identical to the pre-existing path when unset.
-        execution_host = task.get("execution_host", "local")
+        # execution_host targeting. Precedence: task.execution_host >
+        # config.json default_execution_host > engine default ("shuttle", env
+        # TALOS_DEFAULT_EXECUTION_HOST). AWS-local is an explicit opt-in since
+        # 2026-09-05 (fleet plan 1.2): the 3.7GB head must not build. The
+        # resolved value is persisted into task.json so the autorunner, the
+        # sync/reaper watchers and complete-handoff all see the same host.
+        project_cfg = read_json(root / "config.json", {}) or {}
+        execution_host = remote_exec.resolve_execution_host(task, project_cfg)
+        if task.get("execution_host") != execution_host:
+            task["execution_host"] = execution_host
+            write_json(task_dir / "task.json", task)
         remote = False
+        remote_project_root = ""
         sandboxed = False
         sandbox_cfg: "dict[str, Any] | None" = None
         # `project` in task.json is a dict ({"name","root"}); the sandbox CLI
@@ -1621,27 +1630,103 @@ def run_handoff(args: argparse.Namespace) -> int:
             cfg = remote_exec.shuttle_config(task)
             ssh_target = cfg["ssh_target"]
             mirror_root = cfg["mirror_root"]
+            # A Shuttle run needs the repo mirror path. Without it the builder
+            # would only see its own brief and block immediately (2026-07-18).
+            # FAIL LOUD — never run on the AWS head instead.
+            remote_project_root = remote_exec.shuttle_project_root(task, project_cfg) or ""
+            if not remote_project_root:
+                reason = (
+                    "execution_host=shuttle but no Shuttle repo mapping: set "
+                    "execution_hosts.shuttle.project_root in .openclaw/claude-loop/"
+                    "config.json (or task.shuttle.project_root), or set "
+                    "execution_host=local explicitly in task.json"
+                )
+                remote_exec.log_fallback(
+                    root / "logs", task_id,
+                    f"{reason} (NO local fallback — AWS-head OOM guard)", 0, utc_now(),
+                )
+                record_handoff_alert(
+                    root, task_dir, task_id,
+                    outcome="shuttle_mapping_missing",
+                    reason=reason,
+                    suggested_state="needs_approval",
+                    ssh_target=ssh_target,
+                    transport="shuttle",
+                    recovery=(
+                        "clone the repo on the Shuttle, add execution_hosts.shuttle."
+                        "project_root to the project's config.json, re-run run-handoff; "
+                        "or set execution_host=local in task.json for an explicit "
+                        "AWS-local run"
+                    ),
+                )
+                print(f"Shuttle mapping missing for {task_id}: {reason}", file=sys.stderr)
+                raise SystemExit(
+                    f"execution_host=shuttle for {task_id} but no Shuttle repo "
+                    f"mapping; local fallback is disabled by design (AWS-head OOM "
+                    f"guard). Add execution_hosts.shuttle.project_root to config.json "
+                    f"and re-run run-handoff."
+                )
+            _sh = task.get("shuttle") if isinstance(task.get("shuttle"), dict) else {}
+            if _sh.get("project_root") != remote_project_root:
+                task["shuttle"] = {**_sh, "project_root": remote_project_root}
+                write_json(task_dir / "task.json", task)
             ok, latency_ms, reason = remote_exec.preflight(
                 ssh_target, cfg["preflight_timeout_s"]
             )
             if ok:
                 remote = True
             else:
-                # Shuttle offline / unreachable -> log one line and run local.
+                # Shuttle offline / unreachable -> FAIL LOUD. Same policy as the
+                # sandbox arm: a task must NEVER self-heal into a local claude-p
+                # on the 3.7GB AWS head. Dead-man alert + SystemExit, task left
+                # re-runnable at needs_approval.
                 remote_exec.log_fallback(
-                    root / "logs", task_id, reason, latency_ms, utc_now()
+                    root / "logs", task_id,
+                    f"shuttle preflight failed: {reason} "
+                    f"(NO local fallback — AWS-head OOM guard)",
+                    latency_ms, utc_now(),
+                )
+                record_handoff_alert(
+                    root, task_dir, task_id,
+                    outcome="shuttle_preflight_failed",
+                    reason=(
+                        f"Shuttle preflight failed ({reason} after {latency_ms}ms). "
+                        f"Refused to fall back to a local claude-p on the AWS head "
+                        f"(OOM risk); task left re-runnable at needs_approval."
+                    ),
+                    suggested_state="needs_approval",
+                    ssh_target=ssh_target,
+                    transport="shuttle",
+                    recovery=(
+                        "check the Shuttle (ssh/ping dimitris@100.98.174.24) and "
+                        "re-run run-handoff once it is reachable"
+                    ),
                 )
                 print(
-                    f"Shuttle preflight failed ({reason} after {latency_ms}ms); "
-                    "falling back to local screen."
+                    f"Shuttle preflight failed ({reason} after {latency_ms}ms). "
+                    f"NOT falling back to local (AWS-head OOM guard); task {task_id} "
+                    f"left parked at needs_approval — re-run run-handoff once the "
+                    f"Shuttle is reachable.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(
+                    f"shuttle preflight failed for {task_id} and local fallback is "
+                    f"disabled by design (AWS-head OOM guard). Task is re-runnable; "
+                    f"check the Shuttle and re-run run-handoff."
                 )
 
         if remote:
             remote_dir = remote_exec.remote_task_dir(mirror_root, task_id)
-            # Rebuild the claude command with remote mirror paths: the AWS
-            # task_dir/project_root do not exist on the Shuttle, the rsynced
-            # mirror does.
-            remote_prompt = build_handoff_prompt(Path(remote_dir), Path(remote_dir))
+            # Rebuild the claude command with remote paths: the AWS task_dir/
+            # project_root do not exist on the Shuttle. The builder runs INSIDE
+            # the mirrored repo (cwd, so --setting-sources user,project loads the
+            # repo's own CLAUDE.md/.claude) and writes task files into the
+            # rsynced task mirror dir.
+            remote_prompt = build_handoff_prompt(Path(remote_project_root), Path(remote_dir)) + (
+                f"\nRepository: {remote_project_root} (your working directory). "
+                f"Task files (prompt.md, result.json, logs) live in {remote_dir}; "
+                f"writing there is the one allowed exception to the boundary above."
+            )
             remote_argv = [
                 "claude",
                 "-p",
@@ -1679,6 +1764,7 @@ def run_handoff(args: argparse.Namespace) -> int:
                         session_name=session_name,
                         claude_cmd=remote_claude_cmd,
                         env=_remote_env,
+                        cwd=remote_project_root,
                     ),
                     root=root,
                     task_id=task_id,
@@ -1686,36 +1772,48 @@ def run_handoff(args: argparse.Namespace) -> int:
                         ssh_target, session_name
                     ),
                 )
-            except Exception as exc:  # noqa: BLE001 — degraded, not fatal
-                # SPOF fix: a failed remote dispatch (rsync/ssh) used to raise
-                # straight out of run_handoff — traceback, no record, task left
-                # parked at needs_approval with nobody told. The Shuttle path
-                # already has a documented fallback for a failed PREFLIGHT;
-                # a failed DISPATCH is the same situation discovered one step
-                # later, so it gets the same treatment: log it, run local.
-                #
-                # No dead-man alert here on purpose: the run RECOVERED. An
-                # outstanding handoff-alert.json must keep meaning "a human has
-                # to look at this task", so a self-healed degradation belongs in
-                # the event logs (shuttle-offload-fallback.jsonl, which the
-                # shuttle watcher already consumes), not in the alert channel.
+            except Exception as exc:  # noqa: BLE001 — degraded, FAIL LOUD
+                # A failed remote dispatch (rsync/ssh) after retries. Until
+                # 2026-09-05 this silently fell back to a local claude-p on the
+                # AWS head; that is exactly the OOM path the fleet plan forbids.
+                # Same treatment as the sandbox arm: record the event, raise a
+                # dead-man alert, leave the task re-runnable at needs_approval.
                 detail = resilience.describe(exc)
                 remote_exec.log_fallback(
                     root / "logs", task_id,
-                    f"dispatch failed after {SPAWN_ATTEMPTS} attempts: {detail}",
+                    f"dispatch failed after {SPAWN_ATTEMPTS} attempts: {detail} "
+                    f"(NO local fallback — AWS-head OOM guard)",
                     -1, utc_now(),
                 )
                 log_handoff_event(
                     root, task_id, "remote_dispatch_failed",
                     error=detail, ssh_target=ssh_target,
-                    recovery="fell back to local screen",
+                    recovery="task left at needs_approval; check ssh/rsync to the Shuttle and re-run run-handoff",
+                )
+                record_handoff_alert(
+                    root, task_dir, task_id,
+                    outcome="shuttle_dispatch_failed",
+                    reason=(
+                        f"Shuttle dispatch failed after {SPAWN_ATTEMPTS} attempts "
+                        f"({detail}). NOT falling back to local (AWS-head OOM guard); "
+                        f"task left re-runnable at needs_approval."
+                    ),
+                    suggested_state="needs_approval",
+                    ssh_target=ssh_target,
+                    transport="shuttle",
+                    recovery="check ssh/rsync to the Shuttle and re-run run-handoff",
                 )
                 print(
                     f"Shuttle dispatch failed after {SPAWN_ATTEMPTS} attempts "
-                    f"({detail}); falling back to local screen.",
+                    f"({detail}). NOT falling back to local (AWS-head OOM guard); "
+                    f"task {task_id} left parked at needs_approval.",
                     file=sys.stderr,
                 )
-                remote = False
+                raise SystemExit(
+                    f"shuttle dispatch failed for {task_id} and local fallback is "
+                    f"disabled by design (AWS-head OOM guard). Task is re-runnable; "
+                    f"check ssh/rsync to the Shuttle and re-run run-handoff."
+                )
             else:
                 update_status(
                     task_dir,
