@@ -1,8 +1,9 @@
-"""AUTO/MANUAL fence machinery for DocSync.
+"""AUTO/MANUAL fence machinery — same convention as Atlas project-skills.
 
-Defines the AUTO/MANUAL fence regex and the helpers to read, replace, and
-append AUTO fenced regions in documentation files. A doc fenced with these
-conventions can be read and updated by DocSync without touching MANUAL regions.
+Prior art: `scripts/project-skills/regen.py` (fence regex, replace_auto_regions).
+We DO NOT import that module because Atlas lives in the workspace repo, not the
+claude-loop-module distribution. We keep the same convention so a doc fenced by
+Atlas is round-tripped by DocSync (and vice versa).
 """
 
 from __future__ import annotations

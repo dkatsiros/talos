@@ -26,6 +26,7 @@ from .applier import (
     AUTO_COMMIT_MODE,
     DEFAULT_CONFIDENCE_THRESHOLD,
     PROPOSE_MODE,
+    ApplyArtifactError,
     apply_proposals,
 )
 from .updater import DEFAULT_MAX_DIFF_LOC, PROJECT_DEFAULT_KNOWN_DOCS, run_doc_updater
@@ -62,13 +63,26 @@ def cmd_propose(args: argparse.Namespace) -> int:
     )
 
     task_id = _sanitize_task_id(args.task_id or (args.diff_from or "manual"))
-    result = apply_proposals(
-        project_root=project_root,
-        task_id=task_id,
-        proposals=ur.proposals,
-        mode=args.mode,
-        confidence_threshold=args.confidence_threshold,
-    )
+    try:
+        result = apply_proposals(
+            project_root=project_root,
+            task_id=task_id,
+            proposals=ur.proposals,
+            mode=args.mode,
+            confidence_threshold=args.confidence_threshold,
+        )
+    except ApplyArtifactError as exc:
+        # The decisions were made but could not be persisted. Report them on
+        # stderr with a non-zero exit instead of dying on a traceback that shows
+        # the operator nothing about what the run actually decided.
+        print(
+            json.dumps(
+                {"error": str(exc), "applier": exc.result.summary()},
+                indent=2, sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 3
 
     out = {
         "updater": {

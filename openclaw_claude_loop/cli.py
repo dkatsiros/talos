@@ -15,10 +15,12 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from . import __version__
 from . import remote_exec
+from . import resilience
+from . import sandbox_exec
 from .docsync.hook import maybe_run_docsync
 
 LOOP_DIR = Path(".openclaw") / "claude-loop"
@@ -135,6 +137,14 @@ def default_config(project_root: Path) -> dict[str, Any]:
                 "external_posts",
             ],
         },
+        # Auto-delivery reconciler (Phase 1). heal_enabled is the gate for the
+        # highest-blast-radius action (auto-merging stranded branches): OFF by
+        # default, flip to true (or env TALOS_RECONCILE_HEAL=1) only once a human
+        # has approved automatic merge-heal for this project.
+        "reconciler": {
+            "base": "main",
+            "heal_enabled": False,
+        },
     }
 
 
@@ -176,6 +186,26 @@ you respect the project's stack, conventions, and current state.
 
 If you produce only a textual "done" summary, the handoff is invalid. Leave
 the orchestrator concrete artifact paths and a clear deployment status every time.
+
+## Test-driven development + deploy gate (MANDATORY — every project, by default)
+
+This project is test-driven. Silent regressions are the failure mode to prevent
+("you did not even understand something broke" — Dimitris, 2026-09-03).
+
+- **Every feature/behaviour you deliver ships WITH tests in the SAME task** —
+  concrete assertions for its acceptance criteria (routes present, nav/layout
+  structure, key flows work), not just a compile/type check.
+- **Deploys are GATED on green.** The deploy path (deploy script / CI) MUST run
+  the full suite first and REFUSE to deploy on red. Never push code that fails
+  its own tests to a live environment.
+- **When a test goes red, decide + act — never ignore:** either (a) a regression
+  → fix the code, or (b) an intentional change made the assertion obsolete →
+  update the test deliberately and note it in the result. Surfacing the break is
+  the whole point.
+- **Visual layer for UI:** include Playwright **screenshot capture** (phone +
+  desktop) so visual regressions are catchable alongside behavioural assertions.
+- If the project has **no suite yet**, scaffold a minimal one covering the
+  feature you're touching AND wire the deploy gate — leave it better than found.
 
 ## Verify UI changes with Playwright (MANDATORY for any frontend change)
 
@@ -482,10 +512,10 @@ def claim_next(root: Path, task_id: str | None = None) -> ClaimedTask | None:
                      preserved for `run-worker` compatibility).
     task_id=<id>  -> claim THAT token specifically.
 
-    Blind FIFO was the root cause of a silent-black-hole bug: a caller asked to
-    prepare task X, FIFO promoted task Y (or nothing at all), and X rotted in
-    pending/ — a directory the autorunner never reads — with zero log lines and
-    attempt=0. Targeted claiming makes dispatch deterministic.
+    Blind FIFO was the root cause of the 2026-07-18 silent black hole: a caller
+    asked to prepare task X, FIFO promoted task Y (or nothing at all), and X
+    rotted in pending/ — a directory the autorunner never reads — with zero log
+    lines and attempt=0. Targeted claiming makes dispatch deterministic.
     """
     if task_id:
         queue_file = root / "queue" / "pending" / f"{task_id}.json"
@@ -501,7 +531,7 @@ def claim_next(root: Path, task_id: str | None = None) -> ClaimedTask | None:
 
     # SELF-HEAL the destination directory.
     #
-    # queue/claimed/ was missing in every project (verified in production). The
+    # queue/claimed/ was missing in ALL 16 projects (verified 2026-07-18). The
     # rename below then raised FileNotFoundError -- for the MISSING DESTINATION,
     # not a missing source -- and the bare handler swallowed it and returned
     # None. Result: prepare() reported "processed=0", promoted nothing, and
@@ -771,8 +801,8 @@ def screen_session_alive(screen_bin: str, session_name: str) -> bool:
     # Exact-name match (line-anchored), not substring: task ids truncated to 40
     # chars share prefixes, and a substring check would report a sibling task's
     # session as "alive" for this one. NOTE: the NAME FORMAT itself must stay
-    # claude-loop-<id[:40]> — any external watcher that derives the same session
-    # name from the task_id depends on this convention.
+    # claude-loop-<id[:40]> — max-talos-reaper derives the same name
+    # independently and reaps tasks whose session it cannot find.
     pattern = re.compile(r"^\s*\d+\." + re.escape(session_name) + r"\s", re.MULTILINE)
     return bool(pattern.search(result.stdout))
 
@@ -784,7 +814,7 @@ def screen_session_alive(screen_bin: str, session_name: str) -> bool:
 def _is_own_git_repo(project_root: Path) -> bool:
     """True only when project_root is the top-level of its own git repository.
 
-    Guards against workspace-nested projects (e.g. projects/example inside
+    Guards against workspace-nested projects (e.g. projects/morpheus inside
     the workspace repo): for those, git would report the workspace root as the
     top-level, and creating a worktree there would pollute the wrong repo.
     """
@@ -1006,6 +1036,71 @@ def merge_back_worktree(project_root: Path, task_id: str,
     return {"state": "merged", "branch": branch, "base": base, "commits": ahead}
 
 
+def record_merge_proof(project_root: Path, outcome: dict[str, Any] | None,
+                       base: str | None = None) -> dict[str, Any] | None:
+    """Phase 1 (A.1): stamp a durable merge-proof onto a finalize outcome.
+
+    Every finalized task must record the ``tip_sha`` its work landed at so the
+    reconciler can prove ``DELIVERED`` via ``git merge-base --is-ancestor`` even
+    after the talos/<id> branch is deleted. This is the one wiring the Phase 0
+    module deferred to a Dimitris-gated step (see reconciler.compute_merge_proof).
+
+    Resolution: prefer the branch tip while it still exists (exact proof); once
+    merge-back has deleted the branch (states merged/empty/already_merged) fall
+    back to the base tip — which now contains the work, so is-ancestor still
+    passes. Best-effort and NEVER raises: a proof we couldn't compute must not
+    roll back a completed task. Mutates and returns ``outcome`` in place.
+    """
+    if not isinstance(outcome, dict):
+        return outcome
+    b = outcome.get("base") or base
+    branch = outcome.get("branch")
+    try:
+        tip = ""
+        if branch:
+            r = _git(project_root, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}")
+            tip = r.stdout.strip()
+        base_sha = ""
+        if b:
+            rb = _git(project_root, "rev-parse", "--verify", "--quiet", f"{b}^{{commit}}")
+            base_sha = rb.stdout.strip()
+        if not tip:
+            # Branch gone (merged/empty/already_merged) or task ran directly in
+            # project_root (no_worktree): the base tip is the best-available proof.
+            tip = base_sha
+        if tip:
+            outcome.setdefault("tip_sha", tip)
+        if base_sha:
+            outcome.setdefault("base_sha", base_sha)
+        if b:
+            outcome.setdefault("base", b)
+    except Exception:  # noqa: BLE001 — a proof is advisory; never fail finalize
+        pass
+    return outcome
+
+
+def reconcile_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    """The ``reconciler`` sub-config, or an empty dict."""
+    cfg = (config or {}).get("reconciler") if isinstance(config, dict) else None
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def reconcile_heal_enabled(config: dict[str, Any] | None) -> bool:
+    """Resolve the merge-heal gate. OFF unless explicitly enabled.
+
+    Precedence: config ``reconciler.heal_enabled`` (explicit true/false wins) >
+    env ``TALOS_RECONCILE_HEAL`` > default False. Healing auto-merges stranded
+    branches — the highest-blast-radius action — so the default is deny.
+    """
+    cfg = reconcile_config(config)
+    if "heal_enabled" in cfg:
+        return bool(cfg["heal_enabled"])
+    env = os.environ.get("TALOS_RECONCILE_HEAL")
+    if env is not None:
+        return env.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
 def build_handoff_prompt(
     project_root: Path,
     task_dir: Path,
@@ -1111,6 +1206,254 @@ def validate_completed_result_contract(result: dict[str, Any], task: dict[str, A
     return errors
 
 
+# ---------------------------------------------------------------------------
+# Handoff failure visibility (dead-man signal)
+# ---------------------------------------------------------------------------
+#
+# Every failure path in run_handoff used to end at a bare `raise SystemExit`.
+# That is loud for whoever is watching the terminal and INVISIBLE to everyone
+# else: status.json still said "running", the queue token still sat in blocked/,
+# and no durable record existed anywhere. A detached run that timed out or died
+# looked exactly like one still working.
+#
+# These helpers write the same failure to four places, so no single channel
+# being missed can hide it:
+#   1. task_dir/handoff-alert.json   — dead-man file, easy to glob for
+#   2. status.json["handoff_alert"]  — visible to `status`, watchers, ProjectLoop
+#   3. the queue token payload       — visible to anyone scanning the queue
+#   4. logs/handoff-events.jsonl     — durable, append-only history
+# plus a stderr line for the operator in the loop right now.
+#
+# DELIBERATE NON-CHANGE: none of this touches status.json's `state`.
+# max-talos-reaper only reaps tasks whose state is running/claimed (it writes
+# the synthetic result.json and moves the token to queue/failed/). Flipping the
+# state to "failed" here would hide a genuinely dead task from the one component
+# that closes it out, stranding its token forever — trading a visible stall for
+# an invisible one. The alert carries `suggested_state` instead, as advice.
+
+HANDOFF_ALERT_FILE = "handoff-alert.json"
+HANDOFF_EVENTS_LOG = "handoff-events.jsonl"
+
+# Attempts for spawning a session (local screen or remote ssh+screen) before we
+# give up on that transport.
+SPAWN_ATTEMPTS = 3
+
+# Consecutive "screen session not found" observations required before we believe
+# the session is really gone. `screen -ls` can miss transiently (fork pressure,
+# a half-written socket dir), and a single false negative used to abort a
+# perfectly healthy run with "exited without writing result.json".
+SESSION_DEATH_CONFIRMATIONS = 3
+
+# Consecutive rsync-pull failures tolerated while polling a remote run before we
+# raise an alert. Polling continues either way — the remote screen is still
+# running; we just stop pretending the sync is fine.
+REMOTE_SYNC_ALERT_AFTER = 3
+
+
+def log_handoff_event(root: Path, task_id: str, event: str, **fields: Any) -> None:
+    """Append one line to logs/handoff-events.jsonl. Best-effort, never raises."""
+    record = {"ts": utc_now(), "task_id": task_id, "event": event}
+    record.update(fields)
+    resilience.append_jsonl(root / "logs" / HANDOFF_EVENTS_LOG, record)
+
+
+def annotate_queue_entry(root: Path, task_id: str, alert: dict[str, Any] | None) -> str | None:
+    """Attach (or clear) the alert on the task's queue token, wherever it sits.
+
+    Best-effort: a queue token that has already moved on is not an error.
+    """
+    entry = find_queue_entry(root, task_id)
+    if entry is None:
+        return None
+    try:
+        payload = read_json(entry, {}) or {}
+        if not isinstance(payload, dict):
+            return None
+        if alert is None:
+            if "handoff_alert" not in payload:
+                return None
+            payload.pop("handoff_alert", None)
+        else:
+            payload["handoff_alert"] = alert
+        write_json(entry, payload)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return str(entry)
+
+
+def record_handoff_alert(
+    root: Path,
+    task_dir: Path,
+    task_id: str,
+    *,
+    outcome: str,
+    reason: str,
+    session_name: str | None = None,
+    session_log: Path | None = None,
+    suggested_state: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Make a stalled/failed/degraded handoff visible. Returns the alert dict."""
+    alert: dict[str, Any] = {
+        "outcome": outcome,
+        "reason": reason,
+        "at": utc_now(),
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+    }
+    if session_name:
+        alert["session_name"] = session_name
+    if session_log is not None:
+        alert["session_log"] = str(session_log)
+    if suggested_state:
+        alert["suggested_state"] = suggested_state
+    alert.update(extra)
+
+    try:
+        write_json(task_dir / HANDOFF_ALERT_FILE, alert)
+    except OSError as exc:
+        print(f"WARNING: could not write handoff alert file: {exc}", file=sys.stderr)
+
+    try:
+        status = read_json(task_dir / "status.json", {}) or {}
+        if isinstance(status, dict):
+            status["handoff_alert"] = alert
+            status["updated_at"] = utc_now()
+            heartbeat = status.setdefault("heartbeat", {})
+            heartbeat["message"] = f"handoff {outcome}: {reason}"
+            write_json(task_dir / "status.json", status)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"WARNING: could not update status.json with handoff alert: {exc}", file=sys.stderr)
+
+    queue_entry = annotate_queue_entry(root, task_id, alert)
+    log_handoff_event(
+        root, task_id, f"handoff_{outcome}",
+        reason=reason,
+        session_name=session_name,
+        queue_entry=queue_entry,
+        suggested_state=suggested_state,
+    )
+    print(f"HANDOFF ALERT [{outcome}] {task_id}: {reason}", file=sys.stderr)
+    print(f"  recorded in {task_dir / HANDOFF_ALERT_FILE}", file=sys.stderr)
+    return alert
+
+
+def clear_handoff_alert(root: Path, task_dir: Path, task_id: str) -> None:
+    """Drop a resolved/superseded alert. Best-effort, never raises.
+
+    An alert that outlives the problem is worse than no alert: the next operator
+    learns to ignore the channel.
+    """
+    try:
+        (task_dir / HANDOFF_ALERT_FILE).unlink()
+    except OSError:
+        pass
+    try:
+        status = read_json(task_dir / "status.json", {}) or {}
+        if isinstance(status, dict) and status.pop("handoff_alert", None) is not None:
+            write_json(task_dir / "status.json", status)
+    except (OSError, json.JSONDecodeError):
+        pass
+    # Sweep every queue state, not just the live ones: an annotated token may
+    # already have been moved on to done/ or failed/ by a finalize.
+    for state in QUEUE_STATES:
+        token = root / "queue" / state / f"{task_id}.json"
+        if not token.exists():
+            continue
+        try:
+            payload = read_json(token, {}) or {}
+            if isinstance(payload, dict) and payload.pop("handoff_alert", None) is not None:
+                write_json(token, payload)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+
+def collect_handoff_alerts(root: Path) -> list[dict[str, Any]]:
+    """Every outstanding handoff alert in this project, for `status`."""
+    alerts: list[dict[str, Any]] = []
+    tasks_dir = root / "tasks"
+    if not tasks_dir.is_dir():
+        return alerts
+    for task_dir in sorted(tasks_dir.iterdir()):
+        if not task_dir.is_dir():
+            continue
+        alert = read_json(task_dir / HANDOFF_ALERT_FILE, None)
+        if isinstance(alert, dict):
+            alerts.append({"task_id": task_dir.name, **alert})
+    return alerts
+
+
+def _spawn_with_retry(
+    describe_what: str,
+    spawn: Callable[[], Any],
+    *,
+    root: Path,
+    task_id: str,
+    already_live: Callable[[], bool] | None = None,
+    attempts: int = SPAWN_ATTEMPTS,
+) -> Any:
+    """Run a session-spawn step with bounded backoff, logging each retry.
+
+    Re-raises the final failure — the caller decides whether that means "fall
+    back to another transport" or "alert and abort".
+    """
+    state = {"tries": 0}
+
+    def _attempt() -> Any:
+        # Double-spawn guard: a spawn can fail AFTER screen actually started
+        # (an ssh connection dropped, a non-zero exit from the wrapper). Firing
+        # a second Claude at the same task would put two agents in a race for
+        # one result.json — strictly worse than the failure we are retrying.
+        if state["tries"] and already_live is not None and already_live():
+            log_handoff_event(
+                root, task_id, "spawn_adopted_existing", transport=describe_what,
+            )
+            return None
+        state["tries"] += 1
+        return spawn()
+
+    def _on_retry(attempt: int, exc: BaseException, delay: float) -> None:
+        detail = resilience.describe(exc)
+        print(
+            f"{describe_what} attempt {attempt} failed ({detail}); "
+            f"retrying in {delay:.1f}s",
+            file=sys.stderr,
+        )
+        log_handoff_event(
+            root, task_id, "spawn_retry",
+            transport=describe_what, attempt=attempt, error=detail, delay_s=delay,
+        )
+
+    return resilience.retry_call(_attempt, attempts=attempts, on_retry=_on_retry)
+
+
+def _session_alive(
+    *,
+    remote: bool,
+    screen_bin: str,
+    session_name: str,
+    ssh_target: str,
+    sandboxed: bool = False,
+    sandbox_cfg: "dict[str, Any] | None" = None,
+    task_id: str = "",
+) -> bool | None:
+    """Liveness probe that distinguishes 'dead' from 'could not tell'.
+
+    Returns True/False, or None when the probe itself failed. None must never be
+    treated as death: `screen -ls`/ssh/`talos-sandbox status` failing is a
+    statement about the probe, not about the session.
+    """
+    try:
+        if sandboxed and sandbox_cfg is not None:
+            # Liveness = the task's container is still running on the Shuttle.
+            return sandbox_exec.is_alive(sandbox_cfg, task_id)
+        if remote:
+            return remote_exec.remote_screen_alive(ssh_target, session_name)
+        return screen_session_alive(screen_bin, session_name)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 DEFAULT_PERMISSION_MODE_BY_ROLE = {
     # All automated Talos roles use bypassPermissions.
     # acceptEdits requires a human to approve every Bash/git call — impossible
@@ -1137,9 +1480,9 @@ def run_handoff(args: argparse.Namespace) -> int:
         raise SystemExit(f"Unknown task: {task_id}")
 
     # Readiness gate: derive from DURABLE artifacts, not only mutable status.json.
-    # (A task whose status drifted out of needs_approval — e.g. finished-but-never-
-    # finalized, or a prepare/handoff version skew — could hit an absolute refusal
-    # here with no recovery path.)
+    # (2026-07-28 Ergon T5/T6 post-mortem: a task whose status drifted out of
+    # needs_approval — e.g. finished-but-never-finalized, or a prepare/handoff
+    # version skew — hit an absolute refusal here with no recovery path.)
     status = read_json(task_dir / "status.json", {})
     state = status.get("state")
     if (task_dir / "result.json").exists():
@@ -1164,7 +1507,7 @@ def run_handoff(args: argparse.Namespace) -> int:
             raise SystemExit(
                 f"Task {task_id} state is {state!r} (expected needs_approval). "
                 "If the session finished, result.json would trigger auto-finalize; "
-                "if it died mid-run with no result, use your task-reaper tooling. "
+                "if it died mid-run with no result, use max-talos-reaper. "
                 "Otherwise run subscription-interactive first."
             )
 
@@ -1200,19 +1543,82 @@ def run_handoff(args: argparse.Namespace) -> int:
                 f"Screen session {session_name} already running. Attach with: screen -r {session_name}"
             )
 
-        # Per-task model override: task.json["model"] selects the Talos model.
-        # CTO convention: sonnet for easy/research/diagnose; opus (default) for hard builds.
-        # This is extracted early so both remote + local paths use the same value.
-        task_model = task.get("model", "").strip() if isinstance(task, dict) else ""
+        # A fresh attempt supersedes whatever the previous one alerted about.
+        clear_handoff_alert(root, task_dir, task_id)
 
-        # execution_host targeting (remote-offload, Path C). Default is local;
+        # execution_host targeting (shuttle-offload, Path C). Default is local;
         # behaviour is byte-identical to the pre-existing path when unset.
         execution_host = task.get("execution_host", "local")
         remote = False
+        sandboxed = False
+        sandbox_cfg: "dict[str, Any] | None" = None
+        # `project` in task.json is a dict ({"name","root"}); the sandbox CLI
+        # wants the bare name string (it goes through shlex.quote). Normalise so
+        # a dict here can't blow up spawn_sandbox with a TypeError (which used to
+        # silently fall the task back to a LOCAL claude-p on the fragile head).
+        _proj = task.get("project")
+        sandbox_project = (
+            _proj.get("name") if isinstance(_proj, dict) else _proj
+        ) or project_root.name
         ssh_target = ""
         mirror_root = ""
-        if execution_host == "remote":
-            cfg = remote_exec.remote_config(task)
+        if execution_host == "shuttle-sandbox":
+            # Containerised Talos Sandbox (Milestone 2). Opt-in; if the Shuttle
+            # is reachable, runs the agent in an isolated container there.
+            # SAFETY (gap #5 / preflight arm): a preflight failure (Shuttle
+            # offline or kill switch) must NOT self-heal to a local claude-p
+            # screen on the 3.7GB AWS head — same OOM policy as the spawn-
+            # exception handler below. Fail loud: dead-man alert + SystemExit,
+            # leaving the task re-runnable at needs_approval.
+            sandbox_cfg = sandbox_exec.sandbox_config(task)
+            ok, latency_ms, reason = sandbox_exec.preflight(sandbox_cfg)
+            if ok:
+                sandboxed = True
+            else:
+                # Mirror the spawn-exception fail-loud policy exactly.
+                # A Shuttle that is offline or kill-switched is the same
+                # situation as a dispatch that blew up one step later — the task
+                # must NEVER fall back to a local claude-p on this host.
+                remote_exec.log_fallback(
+                    root / "logs", task_id,
+                    f"sandbox preflight failed: {reason} "
+                    f"(NO local fallback — AWS-head OOM guard)",
+                    latency_ms, utc_now(),
+                )
+                record_handoff_alert(
+                    root, task_dir, task_id,
+                    outcome="sandbox_preflight_failed",
+                    reason=(
+                        f"shuttle-sandbox preflight failed ({reason} after "
+                        f"{latency_ms}ms). Refused to fall back to a local "
+                        f"claude-p on the AWS head (OOM risk); task left "
+                        f"re-runnable at needs_approval."
+                    ),
+                    suggested_state="needs_approval",
+                    ssh_target=sandbox_cfg.get("ssh_target"),
+                    transport="shuttle-sandbox",
+                    recovery=(
+                        "task left in needs_approval; check the Shuttle "
+                        "(ssh/ping dimitris@100.98.174.24), remove the kill "
+                        "switch if present (~/.openclaw/talos-sandbox/DISABLED),"
+                        " and re-run run-handoff once the Shuttle is reachable"
+                    ),
+                )
+                print(
+                    f"Sandbox preflight failed ({reason} after {latency_ms}ms). "
+                    f"NOT falling back to local (AWS-head OOM guard); "
+                    f"task {task_id} left parked at needs_approval — re-run "
+                    f"run-handoff once the Shuttle is reachable.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(
+                    f"shuttle-sandbox preflight failed for {task_id} and local "
+                    f"fallback is disabled by design (AWS-head OOM guard). "
+                    f"Task is re-runnable; check the Shuttle and re-run "
+                    f"run-handoff."
+                )
+        elif execution_host == "shuttle":
+            cfg = remote_exec.shuttle_config(task)
             ssh_target = cfg["ssh_target"]
             mirror_root = cfg["mirror_root"]
             ok, latency_ms, reason = remote_exec.preflight(
@@ -1221,19 +1627,19 @@ def run_handoff(args: argparse.Namespace) -> int:
             if ok:
                 remote = True
             else:
-                # Remote host offline / unreachable -> log one line and run local.
+                # Shuttle offline / unreachable -> log one line and run local.
                 remote_exec.log_fallback(
                     root / "logs", task_id, reason, latency_ms, utc_now()
                 )
                 print(
-                    f"Remote host preflight failed ({reason} after {latency_ms}ms); "
+                    f"Shuttle preflight failed ({reason} after {latency_ms}ms); "
                     "falling back to local screen."
                 )
 
         if remote:
             remote_dir = remote_exec.remote_task_dir(mirror_root, task_id)
-            # Rebuild the claude command with remote mirror paths: the local
-            # task_dir/project_root do not exist on the remote host, the rsynced
+            # Rebuild the claude command with remote mirror paths: the AWS
+            # task_dir/project_root do not exist on the Shuttle, the rsynced
             # mirror does.
             remote_prompt = build_handoff_prompt(Path(remote_dir), Path(remote_dir))
             remote_argv = [
@@ -1250,35 +1656,183 @@ def run_handoff(args: argparse.Namespace) -> int:
             if not args.quiet:
                 remote_argv += ["--verbose", "--output-format", "stream-json"]
             remote_claude_cmd = " ".join(remote_argv)
-            _remote_env = dict(os.environ)
-            if task_model:
-                _remote_env["ANTHROPIC_MODEL"] = task_model
-                print(f"Per-task model override (remote): {task_model}")
+            # Per-task model on the non-sandbox Shuttle path: SSH does not carry
+            # the caller env, so the model must travel inside the remote command.
+            # Same precedence as the local path — explicit ANTHROPIC_MODEL, else
+            # task.json["model"], else the DEFAULT_ANTHROPIC_MODEL (opus-4-8).
+            _remote_model = os.environ.get("ANTHROPIC_MODEL", "").strip() \
+                or str(task.get("model") or "").strip()
+            _remote_env = {"ANTHROPIC_MODEL": _remote_model} if _remote_model else None
+            try:
+                _spawn_with_retry(
+                    "shuttle ssh dispatch",
+                    lambda: remote_exec.spawn_remote(
+                        task_dir=task_dir,
+                        task_id=task_id,
+                        ssh_target=ssh_target,
+                        mirror_root=mirror_root,
+                        session_name=session_name,
+                        claude_cmd=remote_claude_cmd,
+                        env=_remote_env,
+                    ),
+                    root=root,
+                    task_id=task_id,
+                    already_live=lambda: remote_exec.remote_screen_alive(
+                        ssh_target, session_name
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — degraded, not fatal
+                # SPOF fix: a failed remote dispatch (rsync/ssh) used to raise
+                # straight out of run_handoff — traceback, no record, task left
+                # parked at needs_approval with nobody told. The Shuttle path
+                # already has a documented fallback for a failed PREFLIGHT;
+                # a failed DISPATCH is the same situation discovered one step
+                # later, so it gets the same treatment: log it, run local.
+                #
+                # No dead-man alert here on purpose: the run RECOVERED. An
+                # outstanding handoff-alert.json must keep meaning "a human has
+                # to look at this task", so a self-healed degradation belongs in
+                # the event logs (shuttle-offload-fallback.jsonl, which the
+                # shuttle watcher already consumes), not in the alert channel.
+                detail = resilience.describe(exc)
+                remote_exec.log_fallback(
+                    root / "logs", task_id,
+                    f"dispatch failed after {SPAWN_ATTEMPTS} attempts: {detail}",
+                    -1, utc_now(),
+                )
+                log_handoff_event(
+                    root, task_id, "remote_dispatch_failed",
+                    error=detail, ssh_target=ssh_target,
+                    recovery="fell back to local screen",
+                )
+                print(
+                    f"Shuttle dispatch failed after {SPAWN_ATTEMPTS} attempts "
+                    f"({detail}); falling back to local screen.",
+                    file=sys.stderr,
+                )
+                remote = False
             else:
-                _remote_env.setdefault("ANTHROPIC_MODEL", remote_exec.DEFAULT_ANTHROPIC_MODEL)
-            remote_exec.spawn_remote(
-                task_dir=task_dir,
-                task_id=task_id,
-                ssh_target=ssh_target,
-                mirror_root=mirror_root,
-                session_name=session_name,
-                claude_cmd=remote_claude_cmd,
-                env=_remote_env,
+                update_status(
+                    task_dir,
+                    "running",
+                    "claude_session",
+                    f"Spawned {role} session {session_name} on shuttle "
+                    f"({ssh_target}, permission_mode={permission_mode})",
+                    0.5,
+                )
+                print(f"Spawned REMOTE screen session on shuttle: {session_name}")
+                print(f"Host:        {ssh_target}  (mirror {remote_dir})")
+                print(f"Role:        {role}  (permission_mode={permission_mode})")
+                print(f"Watch live:  ssh {ssh_target} screen -r {session_name}")
+                print(f"Session log: {session_log}  (rsynced back each poll)")
+
+        if sandboxed:
+            # Containerised sandbox dispatch. The branch talos/<task_id> is
+            # created ON THE SHUTTLE (git worktree in the replica repo); no local
+            # worktree here. The agent runs inside a container mounting only that
+            # worktree; it commits to talos/<task_id> and writes its result file,
+            # which we sync back while polling. merge_back_worktree already
+            # handles a branch-without-local-worktree at finalize time.
+            worktree_base = current_branch(project_root) or "HEAD"
+            model = os.environ.get("ANTHROPIC_MODEL", "").strip() \
+                or str(task.get("model") or "").strip() or "claude-opus-4-8"
+            agent_cmd = task.get("sandbox_agent_cmd") or sandbox_exec.build_agent_container_cmd(
+                handoff_prompt=build_handoff_prompt(Path("/work"), task_dir),
+                role_prompt=role_prompt,
+                permission_mode=permission_mode,
+                model=model,
+                quiet=args.quiet,
             )
-            update_status(
-                task_dir,
-                "running",
-                "claude_session",
-                f"Spawned {role} session {session_name} on remote host "
-                f"({ssh_target}, permission_mode={permission_mode})",
-                0.5,
-            )
-            print(f"Spawned REMOTE screen session: {session_name}")
-            print(f"Host:        {ssh_target}  (mirror {remote_dir})")
-            print(f"Role:        {role}  (permission_mode={permission_mode})")
-            print(f"Watch live:  ssh {ssh_target} screen -r {session_name}")
-            print(f"Session log: {session_log}  (rsynced back each poll)")
-        else:
+            try:
+                sandbox_info = _spawn_with_retry(
+                    "shuttle-sandbox dispatch",
+                    lambda: sandbox_exec.spawn_sandbox(
+                        project_root=project_root,
+                        project=sandbox_project,
+                        task_id=task_id,
+                        base_ref=worktree_base,
+                        agent_cmd=agent_cmd,
+                        cfg=sandbox_cfg,
+                    ),
+                    root=root,
+                    task_id=task_id,
+                    already_live=lambda: sandbox_exec.is_alive(sandbox_cfg, task_id),
+                )
+            except Exception as exc:  # noqa: BLE001 — SAFETY: alert + abort, NEVER local
+                # SAFETY (Talos Sandbox M2 gap #1 — the dangerous one): a failed
+                # shuttle-sandbox dispatch must NOT self-heal to a local claude-p
+                # screen on THIS host. Unlike the plain "shuttle" host (whose
+                # fallback is a bare screen on the Shuttle), the whole point of
+                # shuttle-sandbox is to keep a heavy Opus build OFF the AWS head —
+                # which is 3.7GB and OOMs, freezing the gateway (2026-09-04
+                # incident). So the only safe degradation is fail-loud: record a
+                # dead-man alert and abort, leaving the task re-runnable at
+                # needs_approval for a human/cron to re-dispatch once the Shuttle
+                # sandbox is healthy. DESIGN CALL: fail-and-alert was chosen over a
+                # silent shuttle-SSH fallback so a broken sandbox is never masked.
+                detail = resilience.describe(exc)
+                remote_exec.log_fallback(
+                    root / "logs", task_id,
+                    f"sandbox dispatch failed after {SPAWN_ATTEMPTS} attempts: "
+                    f"{detail} (NO local fallback — AWS-head OOM guard)",
+                    -1, utc_now(),
+                )
+                record_handoff_alert(
+                    root, task_dir, task_id,
+                    outcome="sandbox_dispatch_failed",
+                    reason=(
+                        f"shuttle-sandbox dispatch failed after {SPAWN_ATTEMPTS} "
+                        f"attempts: {detail}. Refused to fall back to a local "
+                        f"claude-p on the AWS head (OOM risk); task left "
+                        f"re-runnable at needs_approval."
+                    ),
+                    suggested_state="needs_approval",
+                    ssh_target=sandbox_cfg.get("ssh_target"),
+                    transport="shuttle-sandbox",
+                    recovery=(
+                        "task left in needs_approval; check the Shuttle sandbox "
+                        "(talos-sandbox status / kill switch at "
+                        "~/.openclaw/talos-sandbox/DISABLED) and re-run run-handoff"
+                    ),
+                )
+                print(
+                    f"Sandbox dispatch failed after {SPAWN_ATTEMPTS} attempts "
+                    f"({detail}). NOT falling back to local (AWS-head OOM guard); "
+                    f"task {task_id} left parked at needs_approval — re-run "
+                    f"run-handoff once the Shuttle sandbox is healthy.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(
+                    f"shuttle-sandbox dispatch failed for {task_id} and local "
+                    f"fallback is disabled by design (AWS-head OOM guard). Task is "
+                    f"re-runnable; fix the Shuttle sandbox and re-run run-handoff."
+                ) from exc
+            else:
+                _st = read_json(task_dir / "status.json", {})
+                # sandbox_info carries worktree_branch/base + preview/db/ports.
+                _st.update(sandbox_info)
+                write_json(task_dir / "status.json", _st)
+                update_status(
+                    task_dir,
+                    "running",
+                    "claude_session",
+                    f"Spawned {role} sandbox on shuttle "
+                    f"(branch {sandbox_info.get('worktree_branch')}, "
+                    f"permission_mode={permission_mode})",
+                    0.5,
+                )
+                print(f"Spawned SANDBOX on shuttle: {sandbox_project}/{task_id}")
+                print(f"Branch:      {sandbox_info.get('worktree_branch')} "
+                      f"(base {worktree_base})")
+                if sandbox_info.get("preview_url"):
+                    print(f"Preview:     {sandbox_info['preview_url']}")
+                if sandbox_info.get("db"):
+                    print(f"Database:    {sandbox_info['db']} "
+                          f"(app={sandbox_info.get('app_port')} serve={sandbox_info.get('serve_port')})")
+                print(f"Watch live:  ssh {sandbox_cfg['ssh_target']} "
+                      f"docker logs -f talos-sbx-{task_id[:32]}")
+
+        if not remote and not sandboxed:
             # Worktree-per-task: create an isolated git worktree so concurrent Talos
             # tasks can't clobber each other's uncommitted source changes. Only
             # attempted when project_root is its own git repo (not workspace-nested).
@@ -1341,31 +1895,57 @@ def run_handoff(args: argparse.Namespace) -> int:
                 + f" 2>&1 | tee {shlex.quote(str(session_log))}"
                 + worktree_cleanup
             )
-            # Model selection (priority order):
-            #   1. task.json["model"] — per-task CTO choice (highest priority)
-            #   2. ANTHROPIC_MODEL env var — caller/shell override
-            #   3. Default: claude-opus-4-8 (hard builds, architecture)
-            #
-            # CTO model convention:
-            #   claude-sonnet-4-6  → easy/read-only/research/diagnose tasks
+            # Talos default model = Opus 4-8 (deliberate: Opus 5 = #1 token
+            # burner, rolled back Aug-2026). Model-selection precedence (same on
+            # local, shuttle and shuttle-sandbox paths):
+            #   1. ANTHROPIC_MODEL env var — caller/shell override (highest)
+            #   2. task.json["model"] — per-task CTO choice
+            #   3. Default: claude-opus-4-8 (hard build/architecture)
+            # Convention:
+            #   claude-sonnet-4-6  → easy/read-only/research/diagnose
             #   claude-opus-4-8    → hard build/architecture/multi-file refactor (default)
-            #   claude-fable-5     → deep reasoning/planning tasks
-            #
-            # To select model in task.json:
-            #   {"model": "claude-sonnet-4-6", ...}
-            # To select via max-dispatch.py:
-            #   python3 scripts/max-dispatch.py --project foo --model claude-sonnet-4-6 ...
+            #   claude-fable-5     → deep reasoning/planning
+            #   claude-fable-5-1   → deep reasoning/planning (Fable 5.1, 2026-09-01)
             spawn_env = os.environ.copy()
-            if task_model:
-                spawn_env["ANTHROPIC_MODEL"] = task_model
-                print(f"Per-task model override (local): {task_model}")
+            _local_model = os.environ.get("ANTHROPIC_MODEL", "").strip() \
+                or str(task.get("model") or "").strip()
+            if _local_model:
+                spawn_env["ANTHROPIC_MODEL"] = _local_model
             else:
                 spawn_env.setdefault("ANTHROPIC_MODEL", "claude-opus-4-8")
-            subprocess.run(
-                [screen_bin, "-dmS", session_name, "bash", "-c", inner],
-                check=True,
-                env=spawn_env,
-            )
+            try:
+                _spawn_with_retry(
+                    "local screen spawn",
+                    lambda: subprocess.run(
+                        [screen_bin, "-dmS", session_name, "bash", "-c", inner],
+                        check=True,
+                        env=spawn_env,
+                    ),
+                    root=root,
+                    task_id=task_id,
+                    already_live=lambda: screen_session_alive(screen_bin, session_name),
+                )
+            except Exception as exc:  # noqa: BLE001 — alerted, then re-raised as SystemExit
+                # This is the end of the line: local screen is the fallback, so
+                # there is nothing left to fall back TO. Nothing ran, so the task
+                # is still safely parked at needs_approval and re-runnable — but
+                # the caller may be a cron/autorunner with nobody reading stderr,
+                # so leave a dead-man record before failing.
+                detail = resilience.describe(exc)
+                record_handoff_alert(
+                    root, task_dir, task_id,
+                    outcome="spawn_failed",
+                    reason=f"screen spawn failed after {SPAWN_ATTEMPTS} attempts: {detail}",
+                    session_name=session_name,
+                    session_log=session_log,
+                    transport="local",
+                    recovery="task left in needs_approval; re-run run-handoff",
+                )
+                raise SystemExit(
+                    f"Could not spawn the Claude session for {task_id} after "
+                    f"{SPAWN_ATTEMPTS} attempts: {detail}. Task is still parked at "
+                    f"needs_approval — fix the host and re-run run-handoff."
+                ) from exc
             update_status(
                 task_dir,
                 "running",
@@ -1397,43 +1977,155 @@ def run_handoff(args: argparse.Namespace) -> int:
                     f"rsync -a {ssh_target}:{remote_exec.remote_task_dir(mirror_root, task_id)}/ "
                     f"{task_dir}/"
                 )
+            elif sandboxed:
+                print(
+                    "(sandbox --detach): poll `talos-sandbox status "
+                    f"{task_id}` on the Shuttle; complete-handoff fetches the "
+                    "branch and merges once result.json is synced back."
+                )
             return 0
 
         result_path = task_dir / "result.json"
         timeout = args.timeout
         interval = args.poll_interval
         elapsed = 0.0
+        # Consecutive-observation counters. Both exist because a SINGLE bad
+        # observation used to be enough to abort a healthy run (`screen -ls`
+        # missing a live session) or to be ignored forever (a wedged rsync).
+        death_misses = 0
+        sync_failures = 0
+        sync_alerted = False
         print(f"Polling for result.json (timeout {timeout}s, interval {interval}s)...")
         while elapsed < timeout:
+            if sandboxed:
+                # Sync the agent's result file out of the sandbox worktree host
+                # dir. Best-effort: absent until the agent writes it. We do NOT
+                # alert on sync failure alone here (the file simply may not exist
+                # yet); death detection below is what surfaces a crashed run.
+                sandbox_exec.sync_result_back(
+                    sandbox_cfg, sandbox_project, task_id, task_dir
+                )
             if remote:
-                remote_exec.rsync_pull(ssh_target, mirror_root, task_id, task_dir)
+                if remote_exec.rsync_pull(ssh_target, mirror_root, task_id, task_dir):
+                    sync_failures = 0
+                else:
+                    sync_failures += 1
+                    if sync_failures >= REMOTE_SYNC_ALERT_AFTER and not sync_alerted:
+                        # The remote session may well be finishing fine; what is
+                        # broken is our ability to SEE it. Keep polling, but stop
+                        # doing it silently — this used to be swallowed whole
+                        # (rsync_pull ran with check=False and no return value),
+                        # so a task could time out purely because results never
+                        # made it back.
+                        sync_alerted = True
+                        record_handoff_alert(
+                            root, task_dir, task_id,
+                            outcome="remote_sync_degraded",
+                            reason=(
+                                f"{sync_failures} consecutive rsync pulls from "
+                                f"{ssh_target} failed; results may not be arriving"
+                            ),
+                            session_name=session_name,
+                            session_log=session_log,
+                            ssh_target=ssh_target,
+                            recovery="still polling; check ssh/rsync to the shuttle",
+                        )
             if result_path.exists():
                 break
-            alive = (
-                remote_exec.remote_screen_alive(ssh_target, session_name)
-                if remote
-                else screen_session_alive(screen_bin, session_name)
+
+            alive = _session_alive(
+                remote=remote,
+                screen_bin=screen_bin,
+                session_name=session_name,
+                ssh_target=ssh_target,
+                sandboxed=sandboxed,
+                sandbox_cfg=sandbox_cfg,
+                task_id=task_id,
             )
-            if not alive:
-                time.sleep(1)
-                if remote:
-                    remote_exec.rsync_pull(ssh_target, mirror_root, task_id, task_dir)
-                if result_path.exists():
-                    break
-                raise SystemExit(
-                    f"Screen session {session_name} exited without writing result.json. "
-                    f"Check {session_log}."
+            if alive is None:
+                # Probe failed: "could not tell" is NOT "dead". Log it and keep
+                # the death counter where it is.
+                log_handoff_event(
+                    root, task_id, "liveness_probe_failed",
+                    session_name=session_name, remote=remote,
                 )
+            elif alive:
+                death_misses = 0
+            else:
+                death_misses += 1
+                if death_misses >= SESSION_DEATH_CONFIRMATIONS:
+                    time.sleep(1)
+                    if remote:
+                        remote_exec.rsync_pull(ssh_target, mirror_root, task_id, task_dir)
+                    if sandboxed:
+                        sandbox_exec.sync_result_back(
+                            sandbox_cfg, sandbox_project, task_id, task_dir
+                        )
+                    if result_path.exists():
+                        break
+                    record_handoff_alert(
+                        root, task_dir, task_id,
+                        outcome="session_died",
+                        reason=(
+                            f"screen session {session_name} gone on "
+                            f"{SESSION_DEATH_CONFIRMATIONS} consecutive probes "
+                            f"with no result.json"
+                        ),
+                        session_name=session_name,
+                        session_log=session_log,
+                        elapsed_s=int(elapsed),
+                        suggested_state="failed",
+                        recovery=f"inspect {session_log}, then re-run or reap the task",
+                    )
+                    raise SystemExit(
+                        f"Screen session {session_name} exited without writing result.json. "
+                        f"Check {session_log}."
+                    )
             time.sleep(interval)
             elapsed += interval
 
         if not result_path.exists():
+            # THE silent stall this whole task is about: before, run_handoff just
+            # raised here. status.json still said "running" (last touched at spawn
+            # time), the queue token still sat in blocked/, and a detached caller
+            # saw nothing at all. Now the timeout is a recorded event.
+            still_alive = _session_alive(
+                remote=remote,
+                screen_bin=screen_bin,
+                session_name=session_name,
+                ssh_target=ssh_target,
+                sandboxed=sandboxed,
+                sandbox_cfg=sandbox_cfg,
+                task_id=task_id,
+            )
+            record_handoff_alert(
+                root, task_dir, task_id,
+                outcome="timeout",
+                reason=f"no result.json after {timeout}s",
+                session_name=session_name,
+                session_log=session_log,
+                elapsed_s=int(elapsed),
+                session_alive=still_alive,
+                # Only advise "failed" when we positively confirmed the session
+                # is gone. A live session that is merely slow must not be
+                # mislabelled — the poll timeout is our patience running out,
+                # not the task's.
+                suggested_state="failed" if still_alive is False else None,
+                recovery=(
+                    f"tail -f {session_log}; re-poll with a larger --timeout, "
+                    f"or complete-handoff once result.json appears"
+                ),
+            )
             raise SystemExit(
                 f"Timeout after {timeout}s waiting for {result_path}. "
-                f"Screen session {session_name} may still be running."
+                f"Screen session {session_name} may still be running. "
+                f"Recorded in {task_dir / HANDOFF_ALERT_FILE}."
             )
 
         print(f"result.json detected after ~{int(elapsed)}s. Running complete-handoff...")
+        # The run produced its artifact; any degradation alert raised while
+        # polling is now history, not an outstanding problem.
+        clear_handoff_alert(root, task_dir, task_id)
         return complete_handoff(args)
 
 
@@ -1507,6 +2199,37 @@ def complete_handoff(args: argparse.Namespace) -> int:
             # race) — that is success, not an error.
             for terminal in ("done", "failed"):
                 if (root / "queue" / terminal / f"{task_id}.json").exists():
+                    # Gap #3 guard: a sandboxed task sitting in queue/done whose
+                    # recorded merge state is not clean was finalized WITHOUT its
+                    # commits landing (the 2026-09-04 incident). Don't silently
+                    # reaffirm success — flag it so nobody trusts a bogus "done".
+                    _fst = read_json(task_dir / "status.json", {})
+                    _fmerge = _fst.get("merge") if isinstance(_fst, dict) else None
+                    _fmerge = _fmerge if isinstance(_fmerge, dict) else {}
+                    if (terminal == "done" and isinstance(_fst, dict)
+                            and _fst.get("sandboxed")
+                            and _fmerge.get("state") not in MERGE_OK_STATES):
+                        record_handoff_alert(
+                            root, task_dir, task_id,
+                            outcome="finalized_without_merge",
+                            reason=(
+                                f"task is in queue/done but sandbox merge state is "
+                                f"{_fmerge.get('state')!r} — commits may still be "
+                                f"stranded on talos/{task_id}."
+                            ),
+                            suggested_state="blocked",
+                            transport="shuttle-sandbox",
+                            recovery=(
+                                f"verify talos/{task_id} merged into its base "
+                                f"branch; re-merge by hand if not"
+                            ),
+                        )
+                        print(json.dumps(
+                            {"task_id": task_id, "state": "already_finalized",
+                             "queue": terminal,
+                             "warning": "sandbox merge not verified — see handoff alert"},
+                            indent=2, sort_keys=True))
+                        return 0
                     print(json.dumps({"task_id": task_id, "state": "already_finalized",
                                       "queue": terminal}, indent=2, sort_keys=True))
                     return 0
@@ -1515,14 +2238,92 @@ def complete_handoff(args: argparse.Namespace) -> int:
             )
 
         _cst = read_json(task_dir / "status.json", {})
+        # Sandbox tasks (Milestone 2): the talos/<task_id> branch lives on the
+        # Shuttle replica; fetch it into the canonical repo BEFORE merge-back,
+        # inside this same blocking merge lock (the fetch must be serialized with
+        # merge exactly as worktree-create already is). merge_back_worktree then
+        # runs unchanged — it already handles a branch with no local worktree.
+        if _cst.get("sandboxed") and result_state == "completed":
+            _sbx_cfg = sandbox_exec.sandbox_config(task)
+            _sbx_proj = _cst.get("project") or task.get("project")
+            _sbx_project = (
+                _sbx_proj.get("name") if isinstance(_sbx_proj, dict) else _sbx_proj
+            ) or project_root.name
+            try:
+                remote_name = sandbox_exec.ensure_local_remote(
+                    project_root, _sbx_cfg, _sbx_project
+                )
+                # Gap #3: a stale local worktree/branch (leftover from a prior
+                # local fallback) makes git refuse the fetch ("refusing to fetch
+                # into branch ... checked out at .worktrees/..."). Auto-prune it
+                # first; the replica holds the authoritative branch.
+                pruned = sandbox_exec.prune_stale_local_refs(project_root, task_id)
+                if pruned:
+                    print("pruned stale local refs before sandbox fetch: "
+                          + "; ".join(pruned))
+                sandbox_exec.fetch_branch(project_root, remote_name, task_id)
+            except Exception as exc:  # noqa: BLE001
+                # A failed fetch means there is nothing to merge. Surface it (do
+                # NOT synthesise success); leave the sandbox up for inspection.
+                raise SystemExit(
+                    f"sandbox fetch of talos/{task_id} failed: {exc}. "
+                    "The Shuttle replica may be unreachable; the sandbox is left "
+                    "up for inspection (talos-sandbox status)."
+                ) from exc
         if result_state == "completed":
             merge_outcome = merge_back_worktree(project_root, task_id, _cst, result)
+            # Phase 1 (A.1): record the merge-proof tip_sha at finalize so the
+            # reconciler can later prove DELIVERED without the branch present.
+            record_merge_proof(project_root, merge_outcome,
+                               base=_cst.get("worktree_base"))
             _cst = read_json(task_dir / "status.json", {})
             _cst["merge"] = merge_outcome
             write_json(task_dir / "status.json", _cst)
             if merge_outcome.get("state") not in MERGE_OK_STATES:
+                # Gap #3: a sandbox task's commits live ONLY on the Shuttle replica
+                # branch (fetched into talos/<id> just above) until this merge
+                # lands — there is no local worktree copy. Moving the token to
+                # done/ on an unclean merge reports success while the work is
+                # stranded on talos/<id> (the 2026-09-04 "interests marked done
+                # WITHOUT merging" incident). For sandbox tasks: alert + abort,
+                # leaving the task finalizable once the merge is resolved by hand.
+                # Local (non-sandbox) worktree behaviour is DELIBERATELY unchanged:
+                # its branch is still present locally, so a dirty merge stays a
+                # warning that marks done, exactly as before.
+                if _cst.get("sandboxed"):
+                    record_handoff_alert(
+                        root, task_dir, task_id,
+                        outcome="merge_back_unclean",
+                        reason=(
+                            f"sandbox merge-back not clean "
+                            f"({merge_outcome.get('state')}): "
+                            f"{merge_outcome.get('detail', '')}. Refusing to mark "
+                            f"done — commits remain on talos/{task_id}."
+                        ),
+                        suggested_state="blocked",
+                        transport="shuttle-sandbox",
+                        recovery=(
+                            f"talos/{task_id} is fetched locally; resolve the "
+                            f"merge by hand onto {merge_outcome.get('base', 'the base branch')}, "
+                            f"then re-run complete-handoff"
+                        ),
+                    )
+                    raise SystemExit(
+                        f"sandbox merge-back for {task_id} was not clean "
+                        f"({merge_outcome.get('state')}): "
+                        f"{merge_outcome.get('detail', '')}. Task NOT marked done; "
+                        f"commits are safe on talos/{task_id}. Resolve and re-run "
+                        f"complete-handoff."
+                    )
                 print(f"⚠ merge-back NOT clean: {merge_outcome.get('state')} — "
                       f"{merge_outcome.get('detail', '')}")
+            elif _cst.get("sandboxed"):
+                # Clean merge: free the Shuttle sandbox (container already exited)
+                # and delete the replica branches. Best-effort — a leftover
+                # lease/branch is reaped by talos-sandbox gc, never a blocker.
+                _sbx_cfg = sandbox_exec.sandbox_config(task)
+                sandbox_exec.teardown(_sbx_cfg, task_id)
+                sandbox_exec.cleanup_remote_branches(project_root, _sbx_cfg, task_id)
 
         # Belt-and-suspenders worktree cleanup — AFTER merge-back, and only when
         # the worktree has no uncommitted changes (never destroy salvageable work).
@@ -1551,6 +2352,11 @@ def complete_handoff(args: argparse.Namespace) -> int:
             f"Handoff completed: {summary[:120]}",
             1.0,
         )
+
+    # The task reached a terminal state, so whatever a previous run-handoff
+    # attempt alerted about (timeout, dead session, degraded sync) is resolved.
+    clear_handoff_alert(root, task_dir, task_id)
+    log_handoff_event(root, task_id, "finalized", state=result_state, queue=target_state)
 
     # Post-run DocSync hook (guarded). Returns None when disabled — then the
     # payload below is byte-identical to pre-Phase-2 behavior. When enabled,
@@ -1601,6 +2407,8 @@ def merge_back_cmd(args: argparse.Namespace) -> int:
     with project_lock(root, "merge", blocking=True):
         status = read_json(task_dir / "status.json", {})
         outcome = merge_back_worktree(project_root, task_id, status, result)
+        # Phase 1 (A.1): stamp the merge-proof tip_sha on the re-merge outcome too.
+        record_merge_proof(project_root, outcome, base=status.get("worktree_base"))
         status = read_json(task_dir / "status.json", {})
         status["merge"] = outcome
         write_json(task_dir / "status.json", status)
@@ -1634,7 +2442,7 @@ def run_worker(args: argparse.Namespace) -> int:
         if claimed is None:
             if target_id:
                 # Explicit target requested but not claimable -> LOUD failure.
-                # Never a silent processed=0 no-op (the root cause of the silent-black-hole bug).
+                # Never a silent processed=0 no-op (the 2026-07-18 root cause).
                 print("processed=0")
                 print(f"ERROR: task {target_id!r} is not in queue/pending/ — "
                       f"it was already prepared, cancelled, or never enqueued. "
@@ -1681,7 +2489,14 @@ def status(args: argparse.Namespace) -> int:
     project_root = project_root_from(args)
     root = require_bootstrap(project_root)
     counts = {state: len(list((root / "queue" / state).glob("*.json"))) for state in QUEUE_STATES}
-    print(json.dumps({"project_root": str(project_root), "queue": counts}, indent=2, sort_keys=True))
+    payload: dict[str, Any] = {"project_root": str(project_root), "queue": counts}
+    # Only present when something is wrong, so a healthy project's payload stays
+    # byte-identical to before. An outstanding alert means a handoff stalled,
+    # died, or degraded and nobody has closed it out yet.
+    alerts = collect_handoff_alerts(root)
+    if alerts:
+        payload["handoff_alerts"] = alerts
+    print(json.dumps(payload, indent=2, sort_keys=True))
     if args.tasks:
         for task_dir in sorted((root / "tasks").iterdir()):
             if task_dir.is_dir():
@@ -1702,6 +2517,88 @@ def doctor(args: argparse.Namespace) -> int:
     }
     print(json.dumps(checks, indent=2, sort_keys=True))
     return 0 if all(value for key, value in checks.items() if key not in {"tmux_binary"}) else 1
+
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    """Phase 1: run the auto-delivery reconciler pass over this project.
+
+    Read-only by default. With --heal (gated) it re-merges stranded done-tasks
+    under the blocking merge lock. --report appends the EOD delivery ledger
+    line; LOOPS.md is ingested (unless --no-loops) so open loops whose tasks are
+    stuck/delivered are surfaced alongside the delivery report. This is the
+    command the EOD cron runs.
+    """
+    from . import reconciler as _rec  # lazy: reconciler imports cli (circular)
+    from . import loops as _loops
+
+    project_root = project_root_from(args)
+    root = require_bootstrap(project_root)
+    config = read_json(root / "config.json", {})
+    base = args.base or reconcile_config(config).get("base") or reconciler_default_base()
+    heal = bool(args.heal)
+    if heal and not reconcile_heal_enabled(config):
+        raise SystemExit(
+            "reconcile --heal is gated OFF for this project. Auto-merging stranded "
+            "branches is the highest-blast-radius action; enable it deliberately via "
+            "config.json reconciler.heal_enabled=true (or env TALOS_RECONCILE_HEAL=1) "
+            "once merge-heal has been approved."
+        )
+
+    if args.scan_crashes:
+        crashes = _rec.scan_crashed_sessions(root)
+        if crashes:
+            print(f"CRASH: {len(crashes)} crashed session(s) surfaced", file=sys.stderr)
+
+    report = _rec.reconcile_project(
+        root, project_root, heal=heal, base=base, ledger_sha=args.ledger_sha,
+    )
+    if args.report:
+        _rec.write_delivery_report(root, report)
+
+    loops_findings: list[dict[str, Any]] = []
+    if not args.no_loops:
+        loops_path = _loops.resolve_loops_path(project_root, args.loops_file)
+        if loops_path is not None:
+            loops_findings = _loops.sweep_loops(loops_path, report)
+            report["loops"] = {"path": str(loops_path), "open": loops_findings}
+
+    print(_rec.render_delivery_report(report))
+    if loops_findings:
+        print(_loops.render_loops_sweep(loops_findings))
+
+    open_items = (report["counts"]["stuck"] + report["counts"]["stranded"]
+                  + report["counts"]["stalled"])
+    loops_stuck = any(f.get("stuck") for f in loops_findings)
+    return 1 if (open_items or loops_stuck) else 0
+
+
+def reconciler_default_base() -> str:
+    from . import reconciler as _rec
+    return _rec.DEFAULT_BASE
+
+
+def cmd_deploy_watch(args: argparse.Namespace) -> int:
+    """Phase 1: commit -> auto-redeploy -> verify-live watcher (dev).
+
+    When the base branch tip advances past the last-deployed sha, run the deploy
+    command, then the verify command, then record the new live sha. Fail-loud:
+    a failed deploy or verify is journalled and exits non-zero; the live sha is
+    only advanced on a clean deploy + verify. Serialized under the 'deploy' lock.
+    """
+    from . import deploy_watch as _dw
+
+    project_root = project_root_from(args)
+    root = require_bootstrap(project_root)
+    config = read_json(root / "config.json", {})
+    base = args.base or reconcile_config(config).get("base") or reconciler_default_base()
+    deploy_cmd = shlex.split(args.deploy_cmd)
+    verify_cmd = shlex.split(args.verify_cmd) if args.verify_cmd else None
+    result = _dw.watch_once(
+        root, project_root, base=base,
+        deploy_cmd=deploy_cmd, verify_cmd=verify_cmd,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("action") in ("deployed", "noop") else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1731,10 +2628,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--created-by", default="openclaw",
         help="Identity to stamp on task.json created_by. Default 'openclaw' is the "
              "raw-CLI/library default and is NOT on the autorunner's TRUSTED_CREATORS "
-             "allowlist (orchestrator/ci/<project>-*) -- tasks created that way are always "
-             "parked for human review, never auto-fired. A caller that IS one of those "
-             "trusted identities (e.g. a per-project Talos/CTO dispatch) should pass its "
-             "real identity here explicitly, e.g. --created-by <project>-cto, instead of "
+             "allowlist (max/argus/talos-*) -- tasks created that way are always parked "
+             "for human review, never auto-fired. A caller that IS one of those trusted "
+             "identities (e.g. a per-project Talos/CTO dispatch) should pass its real "
+             "identity here explicitly, e.g. --created-by talos-<project>, instead of "
              "relying on the default and getting dead-lettered.")
     p.set_defaults(func=enqueue)
 
@@ -1795,6 +2692,33 @@ def build_parser() -> argparse.ArgumentParser:
              "git worktree cannot be created (mandatory for parallel dispatch).",
     )
     p.set_defaults(func=run_handoff)
+
+    p = sub.add_parser(
+        "reconcile",
+        help="Run the auto-delivery reconciler pass (delivery proofs + stranded/"
+             "stalled sweep); optional gated --heal, EOD --report, LOOPS.md sweep.",
+    )
+    p.add_argument("--base", default=None, help="Base branch (default: config reconciler.base or 'main').")
+    p.add_argument("--ledger-sha", default=None, help="Live-deployed sha for the merged->live check.")
+    p.add_argument("--heal", action="store_true",
+                   help="Auto-merge stranded done-tasks (GATED: needs reconciler.heal_enabled).")
+    p.add_argument("--report", action="store_true", help="Append an EOD delivery report to the ledger.")
+    p.add_argument("--scan-crashes", action="store_true",
+                   help="Also scream about claimed tasks whose session died with no result.")
+    p.add_argument("--loops-file", default=None,
+                   help="Path to LOOPS.md (default: auto-discover upward from project root).")
+    p.add_argument("--no-loops", action="store_true", help="Skip LOOPS.md ingestion.")
+    p.set_defaults(func=cmd_reconcile)
+
+    p = sub.add_parser(
+        "deploy-watch",
+        help="Detect new base-branch commits, redeploy, verify live, record the new "
+             "live sha (dev auto-redeploy watcher).",
+    )
+    p.add_argument("--base", default=None, help="Base branch to watch (default: config reconciler.base or 'main').")
+    p.add_argument("--deploy-cmd", required=True, help="Command to (re)deploy when the base tip advances.")
+    p.add_argument("--verify-cmd", default=None, help="Command to verify live after deploy (non-zero = fail-loud).")
+    p.set_defaults(func=cmd_deploy_watch)
 
     p = sub.add_parser("doctor")
     p.set_defaults(func=doctor)

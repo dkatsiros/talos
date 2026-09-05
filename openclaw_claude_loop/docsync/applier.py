@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
+from .. import resilience
 from .fence import (
     AUTO_FENCE_RE,
     append_fresh_auto_region,
@@ -25,6 +26,24 @@ from .updater import PROJECT_DEFAULT_KNOWN_DOCS, Proposal
 
 PROPOSE_MODE = "propose"
 AUTO_COMMIT_MODE = "auto-commit"
+
+# Filesystem attempts for a single doc/artifact write before we call it a real
+# fault. Graphify (2026-08-22): every write here was single-shot, and the
+# artifact write is the LAST statement in the function — one transient EIO and
+# the entire batch of decisions evaporated with nothing on disk to show for it.
+FS_ATTEMPTS = 3
+
+
+class ApplyArtifactError(RuntimeError):
+    """The proposals artifact could not be persisted.
+
+    Carries the ApplyResult so a caller that catches this still knows what the
+    run decided — the decisions are real work, they just have no home on disk.
+    """
+
+    def __init__(self, message: str, result: "ApplyResult") -> None:
+        super().__init__(message)
+        self.result = result
 
 # G14 default: proposals below this confidence never live-commit even in
 # auto-commit mode; they always land as review artifacts.
@@ -39,7 +58,8 @@ class ApplyDecision:
     proposal: Proposal
     action: str  # "written" | "proposed" | "dropped-unknown-doc" | "dropped-out-of-scope"
                  # | "dropped-low-confidence" | "dropped-idempotent" | "dropped-invalid-fence"
-                 # | "dropped-doc-missing" | "dropped-invalid-mode"
+                 # | "dropped-doc-missing" | "dropped-invalid-mode" | "failed-write"
+                 # | "failed-read"
     detail: str = ""
     written_path: Optional[Path] = None
 
@@ -52,18 +72,31 @@ class ApplyResult:
     proposals_dir: Path
     decisions: list[ApplyDecision] = field(default_factory=list)
     proposal_artifact_path: Optional[Path] = None
+    # Degradations that did NOT stop the run but that a human should see —
+    # e.g. a corrupt prior artifact, which silently disables G12 idempotency.
+    warnings: list[str] = field(default_factory=list)
+    # Hard per-proposal faults. The batch continues (one unwritable doc must not
+    # cost us the other nine decisions) but the failure is reported, never
+    # swallowed into a bare "dropped" count.
+    errors: list[str] = field(default_factory=list)
 
     def summary(self) -> dict:
         counts: dict[str, int] = {}
         for d in self.decisions:
             counts[d.action] = counts.get(d.action, 0) + 1
-        return {
+        out = {
             "mode": self.mode,
             "task_id": self.task_id,
             "proposals_dir": str(self.proposals_dir),
             "counts": counts,
             "proposal_artifact_path": str(self.proposal_artifact_path) if self.proposal_artifact_path else None,
         }
+        # Absent when clean, so an untroubled run's summary is unchanged.
+        if self.warnings:
+            out["warnings"] = list(self.warnings)
+        if self.errors:
+            out["errors"] = list(self.errors)
+        return out
 
 
 _VALID_MODES = {"ADD", "UPDATE", "SUPERSEDE", "NEW"}
@@ -139,25 +172,41 @@ def _path_within(project_root: Path, rel_path: str) -> Optional[Path]:
     return resolved
 
 
-def _seen_hashes(project_root: Path, task_id: str) -> set[str]:
+def _seen_hashes(project_root: Path, task_id: str) -> tuple[set[str], Optional[str]]:
     """G12: read prior proposals for this task_id and return the set of patch
-    content-hashes we've already emitted, so re-runs are idempotent."""
+    content-hashes we've already emitted, so re-runs are idempotent.
+
+    Returns (hashes, warning). A failure here used to be swallowed outright,
+    which silently DISABLED idempotency: the same patch would be re-proposed on
+    every run and nothing anywhere said why. Degrading is still the right
+    behaviour (a corrupt artifact must not block doc updates) — degrading
+    quietly is not, so the caller gets a warning to surface.
+    """
     seen: set[str] = set()
     artifact = _artifact_path(project_root, task_id)
-    if artifact.exists():
-        try:
-            data = json.loads(artifact.read_text(encoding="utf-8"))
-            for p in data.get("proposals") or []:
-                h = p.get("hash")
-                if h:
-                    seen.add(h)
-        except (OSError, json.JSONDecodeError):
-            pass
-    return seen
+    if not artifact.exists():
+        return seen, None
+    try:
+        data = json.loads(artifact.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return seen, (
+            f"idempotency degraded: could not read prior proposals at {artifact} "
+            f"({resilience.describe(exc)}); duplicate proposals are possible"
+        )
+    if not isinstance(data, dict):
+        return seen, f"idempotency degraded: {artifact} is not a JSON object"
+    for p in data.get("proposals") or []:
+        if isinstance(p, dict) and p.get("hash"):
+            seen.add(p["hash"])
+    return seen, None
 
 
 def _artifact_path(project_root: Path, task_id: str) -> Path:
     return project_root / ".openclaw" / "claude-loop" / "docsync" / "proposals" / task_id / "proposals.json"
+
+
+def _errors_log_path(project_root: Path) -> Path:
+    return project_root / ".openclaw" / "claude-loop" / "logs" / "docsync-errors.jsonl"
 
 
 def apply_proposals(
@@ -186,7 +235,9 @@ def apply_proposals(
         project_root=project_root,
         proposals_dir=proposals_dir,
     )
-    seen = _seen_hashes(project_root, task_id)
+    seen, seen_warning = _seen_hashes(project_root, task_id)
+    if seen_warning:
+        result.warnings.append(seen_warning)
 
     for p in proposals:
         # Basic validity
@@ -252,9 +303,16 @@ def apply_proposals(
             continue
 
         try:
-            existing = target.read_text(encoding="utf-8")
+            existing = resilience.retry_call(
+                lambda: target.read_text(encoding="utf-8"), attempts=FS_ATTEMPTS
+            )
         except OSError as e:
-            result.decisions.append(ApplyDecision(p, "dropped-doc-missing", str(e)))
+            # A read fault is not "the doc is missing" — that was diagnosed
+            # above. Report it as its own failure so a permissions/IO problem
+            # stops masquerading as a benign drop.
+            detail = resilience.describe(e)
+            result.decisions.append(ApplyDecision(p, "failed-read", detail))
+            result.errors.append(f"{p.doc_path}: read failed: {detail}")
             continue
 
         # G7 core: only touch AUTO fences.
@@ -277,12 +335,23 @@ def apply_proposals(
                 continue
             new_text = append_fresh_auto_region(existing, p.fence_id, p.patch)
 
-        atomic_write(str(target), new_text)
+        try:
+            resilience.retry_call(
+                lambda: atomic_write(str(target), new_text), attempts=FS_ATTEMPTS
+            )
+        except OSError as e:
+            # Was: an unhandled raise that aborted the whole batch mid-loop AND
+            # skipped the artifact write below, so every decision made so far —
+            # including successful writes — vanished with no record.
+            detail = resilience.describe(e)
+            result.decisions.append(ApplyDecision(p, "failed-write", detail))
+            result.errors.append(f"{p.doc_path}: write failed: {detail}")
+            continue
         result.decisions.append(ApplyDecision(
             p, "written", f"hash={h}, mode={p.mode}", written_path=target))
 
     # Persist the artifact (always, so an all-dropped run still leaves a trail).
-    proposals_dir.mkdir(parents=True, exist_ok=True)
+    # mkdir is inside the same retry budget as the write it exists for.
     artifact = _artifact_path(project_root, task_id)
     payload = {
         "task_id": task_id,
@@ -305,6 +374,34 @@ def apply_proposals(
             for d in result.decisions
         ],
     }
-    atomic_write(str(artifact), json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    artifact_text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+    def _persist_artifact() -> None:
+        proposals_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write(str(artifact), artifact_text)
+
+    try:
+        resilience.retry_call(_persist_artifact, attempts=FS_ATTEMPTS)
+    except OSError as exc:
+        # The artifact IS the trail. Losing it means the run happened invisibly,
+        # so this is the one failure we refuse to absorb: record what we can,
+        # then raise a typed error carrying the result. `cli.complete_handoff`
+        # catches it and reports {"state": "errored", ...} on the payload rather
+        # than rolling back an otherwise-successful task.
+        detail = resilience.describe(exc)
+        result.errors.append(f"proposals artifact write failed: {detail}")
+        resilience.append_jsonl(
+            _errors_log_path(project_root),
+            {
+                "task_id": task_id,
+                "mode": mode,
+                "error": detail,
+                "artifact": str(artifact),
+                "decisions": len(result.decisions),
+            },
+        )
+        raise ApplyArtifactError(
+            f"could not persist proposals artifact at {artifact}: {detail}", result
+        ) from exc
     result.proposal_artifact_path = artifact
     return result

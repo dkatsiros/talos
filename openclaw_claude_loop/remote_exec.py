@@ -1,21 +1,18 @@
-"""SSH-remote execution helpers for the remote-offload path.
+"""SSH-remote execution helpers for the shuttle-offload path.
 
-Implements the remote-execution path: keep the whole claude-loop file queue on
-the local host, but run the `screen -dmS ... claude -p ...` execution step on a
-remote node via SSH, with rsync mirroring the task folder before the run and
-pulling results back while polling.
+Implements Path C from projects/shuttle-offload/ARCHITECTURE.md: keep the whole
+claude-loop file queue on AWS, but run the `screen -dmS ... claude -p ...`
+execution step on the Shuttle home node via SSH, with rsync mirroring the task
+folder before the run and pulling results back while polling.
 
-Design invariants:
+Design invariants (see DECISIONS.md):
 - Default execution host is local; nothing here runs unless the task envelope
-  carries execution_host == "remote" (or a named host).
+  carries execution_host == "shuttle".
 - Any preflight failure falls back to the local screen path. We never raise on
-  the remote being offline; we log one JSON line and let the caller run locally.
-- Only the configured SSH user runs agents. No new inbound ports.
-
-Configuration:
-  Set TALOS_SSH_TARGET=user@hostname and TALOS_MIRROR_ROOT=/path/to/tasks in
-  your environment (or in the project's .env file) to point the offload path at
-  your remote execution host. See .env.example for all available options.
+  Shuttle being offline; we log one JSON line and let the caller run locally.
+- Only Dimitris's user runs agents (ssh target dimitris@...), agents write under
+  /home/dimitris/. No new inbound ports, no LAN probing (enforced in the role
+  prompt, ADR-005).
 """
 
 from __future__ import annotations
@@ -30,18 +27,21 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-# Defaults read from environment variables so the package ships without any
-# hardcoded host details. Set TALOS_SSH_TARGET and TALOS_MIRROR_ROOT in your
-# environment or project .env file. A task may also override any of these via a
-# top-level "remote" object in task.json (keys: ssh_target, mirror_root,
-# preflight_timeout_s).
-DEFAULT_SSH_TARGET: str = os.environ.get("TALOS_SSH_TARGET", "user@hostname")
-DEFAULT_MIRROR_ROOT: str = os.environ.get("TALOS_MIRROR_ROOT", "/home/user/.claude-loop-tasks")
+# Defaults mirror the config shape in ARCHITECTURE.md § "Config shape". A task
+# may override any of these via a top-level "shuttle" object in task.json.
+# The SSH target/mirror root default to the live Shuttle node so the autorunner
+# cron (which sets no TALOS_* env) routes shuttle tasks to the Shuttle rather
+# than silently falling back to local — but both stay env-overridable so a
+# public checkout can be re-pointed without a code edit.
+DEFAULT_SSH_TARGET = os.environ.get("TALOS_SSH_TARGET", "dimitris@100.98.174.24")
+DEFAULT_MIRROR_ROOT = os.environ.get("TALOS_MIRROR_ROOT", "/home/dimitris/.claude-loop-tasks")
 DEFAULT_PREFLIGHT_TIMEOUT_S = 3
 # Talos default model, mirrored from the local screen path in cli.run_handoff
 # (spawn_env.setdefault). SSH does not forward arbitrary env vars, so the remote
-# command must carry the model explicitly or the remote host falls back to whatever
-# its own shell profile sets.
+# command must carry the model explicitly or the Shuttle falls back to whatever
+# its own shell profile sets. Opus 4-8 is the deliberate default (Opus 5 = #1
+# token burner; see the Aug-2026 rollback). An explicit ANTHROPIC_MODEL /
+# task.json["model"] override still wins.
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-8"
 
 # Files that make up the task mirror. Everything else in the task dir is either
@@ -60,7 +60,9 @@ def _validate_remote_config(ssh_target: str, mirror_root: str) -> None:
 
     A ssh_target that starts with '-' (or doesn't match user@host) becomes an
     SSH flag on the command line. A mirror_root that is relative or starts with
-    '-' becomes an rsync option. Both are rejected with a clear error.
+    '-' becomes an rsync option. Both are rejected with a clear error. (Ported
+    from the public talos-export hardening — Fix F1 — so the option-injection
+    guard survives the engine reconciliation.)
     """
     if not _SSH_TARGET_RE.match(ssh_target):
         raise ValueError(
@@ -76,15 +78,13 @@ def _validate_remote_config(ssh_target: str, mirror_root: str) -> None:
         )
 
 
-def remote_config(task: dict[str, Any]) -> dict[str, Any]:
-    """Resolve the remote-host connection config from the task envelope.
+def shuttle_config(task: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the shuttle connection config from the task envelope.
 
-    Reads TALOS_SSH_TARGET / TALOS_MIRROR_ROOT from the environment for
-    defaults; a task envelope may override any field under task["remote"].
-    Returns the resolved config after validating ssh_target and mirror_root
-    to prevent option-injection via SSH/rsync.
+    A task may override any field under task["shuttle"]. ssh_target and
+    mirror_root are validated to prevent option-injection via SSH/rsync.
     """
-    cfg = task.get("remote") if isinstance(task.get("remote"), dict) else {}
+    cfg = task.get("shuttle") if isinstance(task.get("shuttle"), dict) else {}
     result = {
         "ssh_target": cfg.get("ssh_target", DEFAULT_SSH_TARGET),
         "mirror_root": cfg.get("mirror_root", DEFAULT_MIRROR_ROOT),
@@ -103,7 +103,7 @@ def _ssh_base(ssh_target: str, *, connect_timeout: int | None = None) -> list[st
 
 
 def preflight(ssh_target: str, timeout_s: int = DEFAULT_PREFLIGHT_TIMEOUT_S) -> tuple[bool, int, str]:
-    """Health-check the remote host before dispatch.
+    """Health-check the Shuttle before dispatch.
 
     Returns (ok, latency_ms, reason). ok is False on any non-zero exit,
     timeout, or ssh error — the caller then falls back to local.
@@ -132,13 +132,13 @@ def preflight(ssh_target: str, timeout_s: int = DEFAULT_PREFLIGHT_TIMEOUT_S) -> 
 
 
 def log_fallback(logs_dir: Path, task_id: str, reason: str, latency_ms: int, ts: str) -> None:
-    """Append one JSON line recording a remote-host -> local fallback event."""
+    """Append one JSON line recording a Shuttle -> local fallback event."""
     logs_dir.mkdir(parents=True, exist_ok=True)
     line = json.dumps(
         {"ts": ts, "task_id": task_id, "reason": reason, "latency_ms": latency_ms},
         ensure_ascii=False,
     )
-    with (logs_dir / "remote-offload-fallback.jsonl").open("a", encoding="utf-8") as handle:
+    with (logs_dir / "shuttle-offload-fallback.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(line + "\n")
 
 
@@ -147,7 +147,7 @@ def remote_task_dir(mirror_root: str, task_id: str) -> str:
 
 
 def rsync_push(task_dir: Path, ssh_target: str, mirror_root: str, task_id: str) -> None:
-    """Mirror the task folder up to the remote host before dispatch."""
+    """Mirror the task folder up to the Shuttle before dispatch."""
     dest = f"{ssh_target}:{remote_task_dir(mirror_root, task_id)}/"
     # Ensure the remote parent exists (rsync -a will create the leaf).
     subprocess.run(
@@ -166,11 +166,14 @@ def rsync_push(task_dir: Path, ssh_target: str, mirror_root: str, task_id: str) 
     subprocess.run(argv, check=True)
 
 
-def rsync_pull(ssh_target: str, mirror_root: str, task_id: str, task_dir: Path) -> None:
-    """Pull result/status/log files back from the remote host while polling.
+def rsync_pull(ssh_target: str, mirror_root: str, task_id: str, task_dir: Path) -> bool:
+    """Pull result/status/log files back from the Shuttle while polling.
 
-    Best-effort: a transient rsync failure during polling should not abort the
-    poll loop (the remote screen keeps running), so we swallow non-zero exits.
+    Best-effort: a transient rsync failure during polling must not abort the
+    poll loop (the remote screen keeps running), so we still never raise. But we
+    now REPORT it — returns True on success, False on any non-zero exit or OSError.
+    A repeatedly failing pull means results are not coming back, which used to be
+    completely invisible: the run just timed out with no explanation.
     """
     src_dir = remote_task_dir(mirror_root, task_id)
     argv = ["rsync", "-a"]
@@ -179,7 +182,11 @@ def rsync_pull(ssh_target: str, mirror_root: str, task_id: str, task_dir: Path) 
         argv += ["--include", name]
     argv += ["--exclude", "*"]
     argv += [f"{ssh_target}:{src_dir}/", f"{str(task_dir).rstrip('/')}/"]
-    subprocess.run(argv, check=False)
+    try:
+        proc = subprocess.run(argv, check=False)
+    except OSError:
+        return False
+    return proc.returncode == 0
 
 
 def resolve_anthropic_model(env: Mapping[str, str] | None = None) -> str:
@@ -202,10 +209,10 @@ def build_remote_inner(
 ) -> str:
     """The command that runs inside the remote screen session.
 
-    ~/.local/bin (where the official Claude Code installer puts `claude`) is not
-    on the PATH for a non-interactive ssh shell, so we prepend it explicitly.
-    ANTHROPIC_MODEL is exported for the same reason: ssh does not carry the
-    caller's env, so the model default has to travel inside the remote command.
+    ~/.local/bin (where the official installer puts claude) is not on the PATH
+    for a non-interactive ssh shell, so we prepend it explicitly. ANTHROPIC_MODEL
+    is exported for the same reason: ssh does not carry the caller's env, so the
+    Talos model default has to travel inside the remote command itself.
     """
     return (
         'export PATH="$HOME/.local/bin:$PATH" && '
@@ -220,7 +227,7 @@ def build_remote_screen_argv(
     session_name: str,
     inner: str,
 ) -> list[str]:
-    """Full argv to spawn a detached screen running `inner` on the remote host.
+    """Full argv to spawn a detached screen running `inner` on the Shuttle.
 
     The remote command (last argv element) contains `screen -dmS`, and `inner`
     contains the `claude -p ...` invocation and the remote mirror path.
@@ -239,6 +246,71 @@ def remote_screen_alive(ssh_target: str, session_name: str) -> bool:
     return session_name in (proc.stdout or "")
 
 
+# --------------------------------------------------------------------------- #
+# Importable ssh/screen/scp helpers (Milestone 2 — sandbox_exec reuses these).
+#
+# These are thin PUBLIC wrappers over the primitives above. They add NO new
+# behaviour to the existing `shuttle` (non-container) host path — that path keeps
+# calling spawn_remote/rsync_push/remote_screen_alive exactly as before. They
+# exist so sandbox_exec.py (the shuttle-sandbox driver) can drive ssh/screen/scp
+# without duplicating the connection-flag conventions established here.
+# --------------------------------------------------------------------------- #
+def ssh_argv(ssh_target: str, *, connect_timeout: int | None = None) -> list[str]:
+    """Public alias for the internal ssh base-argv builder."""
+    return _ssh_base(ssh_target, connect_timeout=connect_timeout)
+
+
+def ssh_run(
+    ssh_target: str,
+    remote_cmd: str,
+    *,
+    connect_timeout: int | None = None,
+    timeout: int | None = None,
+    check: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run a single command on the remote host over ssh, capturing output.
+
+    Same BatchMode/ConnectTimeout conventions as preflight(). Never raises on a
+    non-zero remote exit unless check=True; callers inspect returncode/stdout.
+    """
+    argv = _ssh_base(ssh_target, connect_timeout=connect_timeout) + [remote_cmd]
+    return subprocess.run(
+        argv, capture_output=True, text=True, timeout=timeout, check=check
+    )
+
+
+def spawn_remote_screen(ssh_target: str, session_name: str, inner: str) -> None:
+    """Spawn a detached remote screen running `inner`. Raises on ssh failure.
+
+    Shares build_remote_screen_argv with spawn_remote so the screen-launch
+    convention (screen -dmS ... bash -lc ...) is identical for both the
+    non-container shuttle path and the sandbox path.
+    """
+    argv = build_remote_screen_argv(ssh_target, session_name, inner)
+    subprocess.run(argv, check=True)
+
+
+def scp_pull(
+    ssh_target: str,
+    remote_path: str,
+    local_path: Path,
+    *,
+    timeout: int | None = None,
+) -> bool:
+    """Copy a single file back from the remote host. Best-effort (returns bool)."""
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    argv = [
+        "scp", "-o", "BatchMode=yes",
+        f"{ssh_target}:{remote_path}", str(local_path),
+    ]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
 def spawn_remote(
     *,
     task_dir: Path,
@@ -253,10 +325,12 @@ def spawn_remote(
 
     Raises on rsync/ssh failure so the caller can decide (the caller only
     reaches here after a successful preflight; a failure here is a real error,
-    not "remote host offline").
+    not "Shuttle offline").
 
     env: optional env dict forwarded to build_remote_inner for per-task model
-         selection (e.g. {"ANTHROPIC_MODEL": "claude-sonnet-4-6"}).
+         selection (e.g. {"ANTHROPIC_MODEL": "claude-sonnet-4-6"}). Without it
+         the remote command carries DEFAULT_ANTHROPIC_MODEL — so the non-sandbox
+         Shuttle path honours task.json["model"] exactly like the local path.
     """
     rsync_push(task_dir, ssh_target, mirror_root, task_id)
     remote_dir = remote_task_dir(mirror_root, task_id)

@@ -255,7 +255,7 @@ def maybe_run_docsync(
     )
 
     counts = ar.summary().get("counts", {})
-    return {
+    outcome = {
         "state": "completed",
         "mode": mode,
         "proposals": len(ur.proposals),
@@ -266,3 +266,14 @@ def maybe_run_docsync(
         "artifact": str(ar.proposal_artifact_path) if ar.proposal_artifact_path else None,
         "diff_loc": ur.diff_loc,
     }
+    # Per-proposal faults and degradations do not fail the run, but they must
+    # reach the operator: complete_handoff prints this dict verbatim. Keys are
+    # omitted when clean so a healthy run's payload is unchanged.
+    failed = sum(v for k, v in counts.items() if k.startswith("failed-"))
+    if failed:
+        outcome["failed"] = failed
+    if ar.errors:
+        outcome["errors"] = list(ar.errors)
+    if ar.warnings:
+        outcome["warnings"] = list(ar.warnings)
+    return outcome

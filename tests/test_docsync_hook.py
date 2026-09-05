@@ -80,10 +80,11 @@ def _bootstrap_completed(project: Path) -> tuple[Path, str]:
 
 class HookDisabledIsNoOpTests(unittest.TestCase):
     """Phase-2 safety contract: with docsync disabled (the default for every
-    project), a Talos completion must be a pure no-op:
+    project), a Talos completion must be a pure no-op for DocSync:
         - stdout JSON must not contain a `docsync` key
         - the `.openclaw/claude-loop/docsync/` scratch dir must NOT exist
-        - stdout JSON must have exactly the pre-Phase-2 key set
+        - stdout JSON must have exactly the pre-Phase-2 key set, plus the
+          Phase-1 `merge` proof (always stamped on a completed task).
     """
 
     def test_complete_handoff_default_off_produces_pre_phase2_payload(self) -> None:
@@ -96,11 +97,15 @@ class HookDisabledIsNoOpTests(unittest.TestCase):
             self.assertFalse((loop / "docsync").exists(),
                              "docsync/ directory was created when hook is disabled")
 
-            # stdout is valid JSON, has the expected keys (merge added in Phase-3),
-            # no docsync (docsync hook is disabled for this test).
-            parsed = json.loads(proc.stdout.strip().splitlines()[-1] if False else proc.stdout)
-            self.assertEqual(set(parsed.keys()), {"task_id", "state", "queue", "merge"})
+            # stdout is valid JSON. DocSync disabled => no `docsync` key. A
+            # completed task always carries the Phase-1 `merge` proof; every
+            # other key must be the pre-Phase-2 set.
+            parsed = json.loads(proc.stdout)
             self.assertNotIn("docsync", parsed)
+            self.assertIn("merge", parsed)
+            self.assertEqual(
+                {k for k in parsed if k != "merge"}, {"task_id", "state", "queue"}
+            )
             self.assertEqual(parsed["state"], "completed")
             self.assertEqual(parsed["queue"], "done")
 
@@ -109,24 +114,27 @@ class HookDisabledIsNoOpTests(unittest.TestCase):
             self.assertTrue((loop / "queue" / "done" / f"{task}.json").exists())
 
     def test_bytewise_identical_payload_shape(self) -> None:
-        """The exact bytes of the printed payload must match the current shape.
-        Includes the merge key (added when the worktree path is absent, the
-        outcome is no_worktree). If a future change ever accidentally leaks a
-        docsync=None into the payload, this test catches it."""
+        """With DocSync disabled the payload must be the pre-Phase-2 shape plus
+        only the Phase-1 `merge` proof. If a future change ever accidentally
+        leaks a docsync=None (or any other key) into the payload, this catches
+        it."""
         with TemporaryDirectory() as tmp:
             project = Path(tmp) / "toy"
             loop, task = _bootstrap_completed(project)
             proc = run_cli(project, "complete-handoff", task)
+            parsed = json.loads(proc.stdout)
+            self.assertNotIn("docsync", parsed)
+            # Strip the dynamic merge-proof; the remainder must byte-match the
+            # pre-Phase-2 payload exactly.
+            self.assertIn("merge", parsed)
+            parsed.pop("merge")
             expected = json.dumps(
-                {
-                    "merge": {"detail": "task ran directly in project_root", "state": "no_worktree"},
-                    "queue": "done",
-                    "state": "completed",
-                    "task_id": task,
-                },
+                {"queue": "done", "state": "completed", "task_id": task},
                 indent=2, sort_keys=True,
             )
-            self.assertEqual(proc.stdout.strip(), expected)
+            self.assertEqual(
+                json.dumps(parsed, indent=2, sort_keys=True), expected
+            )
 
 
 # --------------------------------------------------------------------------- #
